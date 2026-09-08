@@ -1,0 +1,19 @@
+# Development and generated builds
+.idea/
+.DS_Store
+bin/
+dist/
+.build/
+
+# Local manga, OCR exports, projects and evaluation artefacts
+samples/
+output/
+scripts/report.py
+**/.mangascan.json
+
+# Local configuration and signing material
+.env
+.env.*
+*.p12
+*.p8
+*.mobileprovision
