@@ -17,3 +17,7 @@ scripts/report.py
 *.p12
 *.p8
 *.mobileprovision
+
+# Python helper caches
+__pycache__/
+*.pyc

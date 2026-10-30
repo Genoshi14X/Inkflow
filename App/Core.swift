@@ -15,6 +15,18 @@ struct Box: Codable, Equatable, Sendable {
 struct OCRLine: Codable, Sendable {
     var text: String; var confidence: Float; var box: Box
 }
+struct TranslationRecord: Codable, Sendable {
+    var text: String
+    var source: String
+    var context: String
+    var model: String
+}
+enum ExportMode: String, CaseIterable, Identifiable {
+    case original = "Оригинал"
+    case translated = "Перевод"
+    case bilingual = "EN + RU"
+    var id: String { rawValue }
+}
 struct TextBlock: Codable, Identifiable, Sendable {
     var id = UUID()
     var text: String
@@ -23,6 +35,7 @@ struct TextBlock: Codable, Identifiable, Sendable {
     var included = true
     var warning: String = ""
     var panel: Int = 0
+    var translation: TranslationRecord? = nil
 }
 struct ScanPage: Codable, Identifiable, Sendable {
     var id: String { file }
@@ -35,11 +48,14 @@ struct ScanPage: Codable, Identifiable, Sendable {
     var reviewed = false
     var error: String? = nil
     var fingerprint: String = ""
+    var translationReviewed: Bool? = nil
 }
 struct Chapter: Codable, Sendable {
-    var version = 1
+    var version = 2
     var name: String
     var pages: [ScanPage]
+    var glossary: String? = nil
+    var browserTranslation: String? = nil
 }
 
 enum ScanError: LocalizedError {
@@ -71,9 +87,13 @@ enum ProjectFiles {
         let urls = try images(in: folder)
         let save = folder.appendingPathComponent(saveName)
         var previous: [String: ScanPage] = [:]
+        var browserTranslation: String? = nil
+        var glossary: String? = nil
         if FileManager.default.fileExists(atPath: save.path) {
             let old = try JSONDecoder().decode(Chapter.self, from: Data(contentsOf: save))
-            guard old.version == 1 else { throw ScanError.incompatible }
+            guard [1,2].contains(old.version) else { throw ScanError.incompatible }
+            browserTranslation = old.browserTranslation
+            glossary = old.glossary
             previous = Dictionary(old.pages.map { ($0.file, $0) }, uniquingKeysWith: { first, _ in first })
         }
         return Chapter(name: folder.lastPathComponent, pages: urls.map { url in
@@ -87,20 +107,33 @@ enum ProjectFiles {
                 return old
             }
             return ScanPage(file: url.lastPathComponent, fingerprint: key)
-        })
+        }, glossary: glossary, browserTranslation: browserTranslation)
     }
     static func save(_ chapter: Chapter, to folder: URL) throws {
         let encoder = JSONEncoder(); encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         try encoder.encode(chapter).write(to: folder.appendingPathComponent(saveName), options: .atomic)
     }
-    static func transcript(_ chapter: Chapter) -> String {
+    static func translationContext(_ page: ScanPage, glossary: String?) -> String {
+        let content = [glossary ?? ""] + page.blocks.filter(\.included).flatMap { [$0.id.uuidString, $0.text] }
+        return String(data:try! JSONEncoder().encode(content),encoding:.utf8)!
+    }
+    static func transcript(_ chapter: Chapter, mode: ExportMode = .original) -> String {
         var parts = ["Глава \(chapter.name)"]
         for page in chapter.pages {
             parts.append("\n=== Страница \(page.file) ===\n")
             if !page.scanned { parts.append("[Страница не распознана]"); continue }
             if !page.reviewed { parts.append("[Порядок и текст не проверены]\n") }
             for (i, block) in page.blocks.filter({ $0.included }).enumerated() {
-                parts.append(String(format: "[%02d]", i + 1) + "\n" + block.text + "\n")
+                var text = String(format: "[%02d]", i + 1) + "\n"
+                if mode != .translated { text += (mode == .bilingual ? "EN: " : "") + block.text + "\n" }
+                if mode != .original {
+                    if let ru = block.translation, !ru.text.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty {
+                        text += (mode == .bilingual ? "RU: " : "") + ru.text + "\n"
+                        if ru.source != block.text || ru.context != translationContext(page,glossary:chapter.glossary) { text += "[Оригинал, порядок или словарь изменились — проверьте перевод]\n" }
+                        else if page.translationReviewed != true { text += "[Перевод не проверен]\n" }
+                    } else { text += "[Нет перевода]\n" }
+                }
+                parts.append(text)
             }
         }
         return parts.joined(separator: "\n") + "\n"
@@ -253,5 +286,28 @@ enum Scanner {
         }
         let panels = PanelDetector.detect(image)
         return ScanPage(file:url.lastPathComponent,width:image.width,height:image.height,blocks:ReadingOrder.blocks(lines,panels:panels),panels:panels,scanned:true,fingerprint:ProjectFiles.fingerprint(url))
+    }
+}
+
+// Preserve every character while keeping browser input below its 10,000-character limit.
+enum BrowserTranslation {
+    static func chunks(_ text: String, limit: Int = 9500) -> [String] {
+        precondition(limit >= 2)
+        var result: [String] = [], current = ""
+        var units = 0
+        for character in text {
+            let next = String(character)
+            if units + next.utf16.count > limit && !current.isEmpty {
+                // Prefer a paragraph/line boundary so replicas usually stay together.
+                if let boundary = current.lastIndex(of: "\n"), current.distance(from: current.startIndex, to: boundary) > current.count / 2 {
+                    let after = current.index(after: boundary)
+                    result.append(String(current[..<after])); current = String(current[after...])
+                } else { result.append(current); current = "" }
+                units = current.utf16.count
+            }
+            current += next; units += next.utf16.count
+        }
+        if !current.isEmpty { result.append(current) }
+        return result
     }
 }

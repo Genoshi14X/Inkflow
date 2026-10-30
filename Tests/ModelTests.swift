@@ -27,10 +27,30 @@ import ImageIO
         try ProjectFiles.save(chapter,to:folder)
         let model = MangaModel(); model.open(folder)
         let id = model.page!.blocks[0].id
+        // Reuse the same editor bindings across writes, reorder and undo, without
+        // recreating the view. A getter capturing a block snapshot stays stale.
+        let originalBinding = model.textBinding(id)
+        let translationBinding = model.textBinding(id,translated:true)
+        precondition(translationBinding.wrappedValue.isEmpty)
+        for value in ["Начало 🗯 середина конец", "Начало 🗯 середна конец", "Начало 🗯 средна конец", "", "Новая реплика"] {
+            originalBinding.wrappedValue = value
+            precondition(originalBinding.wrappedValue == value)
+            translationBinding.wrappedValue = value
+            precondition(translationBinding.wrappedValue == value)
+        }
+        model.undo()
+        precondition(translationBinding.wrappedValue.isEmpty)
+        precondition(originalBinding.wrappedValue == "Новая реплика")
+        model.undo()
+        precondition(originalBinding.wrappedValue.isEmpty)
         model.text(id,value:"EDIT TEST")
         precondition(model.page!.blocks[0].text == "EDIT TEST")
         model.move(id,by:1)
         precondition(model.page!.blocks[1].id == id)
+        precondition(originalBinding.wrappedValue == "EDIT TEST")
+        translationBinding.wrappedValue = "Правка перевода"
+        precondition(model.page!.blocks[1].translation?.text == "Правка перевода")
+        precondition(originalBinding.wrappedValue == "EDIT TEST")
         model.include(id,value:false)
         precondition(!model.page!.blocks[1].included)
         model.undo(); precondition(model.page!.blocks[1].included)
@@ -46,14 +66,19 @@ import ImageIO
         let before = reopened.page!.blocks.map(\.text)
         reopened.scanAll()
         precondition(reopened.page!.blocks.map(\.text) == before && !reopened.busy)
+        reopened.chapter?.pages[0].translationReviewed = true
         reopened.addRegion(Box(x:0.82,y:0.04,width:0.16,height:0.1))
         while reopened.busy { try await Task.sleep(nanoseconds:20_000_000) }
         precondition(reopened.page!.blocks.count == count+1)
         precondition(reopened.page!.blocks.last!.text.contains("MOM"))
         precondition(!reopened.page!.reviewed)
+        precondition(reopened.page!.translationReviewed == false)
+        reopened.setBrowserTranslation("Сохранить этот черновик")
         reopened.undo(); precondition(reopened.page!.blocks.count == count)
+        precondition(reopened.chapter?.browserTranslation == "Сохранить этот черновик")
         let saved = try ProjectFiles.load(folder)
         precondition(saved.pages[0].blocks.count == count)
+        precondition(saved.browserTranslation == "Сохранить этот черновик")
         print("PASS: model edit, reorder, include, merge, delete, undo, review, reopen, rescan preservation, crop OCR, persistence")
     }
 }

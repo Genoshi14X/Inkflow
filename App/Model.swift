@@ -15,6 +15,13 @@ final class MangaModel: ObservableObject {
     @Published var adding = false
     @Published var showPanels = false
     @Published var zoom = 1.0
+    @Published var exportMode: ExportMode = .original
+    @Published var showBrowserTranslation = false
+    @Published var browserPart = 0
+    var browserParts: [String] {
+        guard let chapter else { return [] }
+        return BrowserTranslation.chunks(ProjectFiles.transcript(chapter, mode: .original))
+    }
     @Published var undoHistory: [Chapter] = []
     private var stopRequested = false
     private var unsaved = false
@@ -47,9 +54,20 @@ final class MangaModel: ObservableObject {
     func edit(_ action: (inout ScanPage) -> Void) {
         guard !busy, let i = pageIndex, var c = chapter else { return }
         undoHistory.append(c); if undoHistory.count > 80 { undoHistory.removeFirst() }
-        action(&c.pages[i]); c.pages[i].reviewed = false
+        action(&c.pages[i]); c.pages[i].reviewed = false; c.pages[i].translationReviewed = false
         chapter = c; unsaved = true
         if save() { status = "Правки сохранены в папке главы" }
+    }
+    func textBinding(_ id: UUID, translated: Bool = false) -> Binding<String> {
+        // Read the live model, not a BlockCard's captured value. TextEditor can
+        // read this binding again after a write, before SwiftUI rebuilds the card.
+        Binding(get: {
+            guard let block = self.page?.blocks.first(where: { $0.id == id }) else { return "" }
+            return translated ? block.translation?.text ?? "" : block.text
+        }, set: { value in
+            if translated { self.translationText(id, value:value) }
+            else { self.text(id, value:value) }
+        })
     }
     func text(_ id: UUID, value: String) { edit { p in if let i = p.blocks.firstIndex(where: { $0.id == id }) { p.blocks[i].text = value } } }
     func include(_ id: UUID, value: Bool) { edit { p in if let i = p.blocks.firstIndex(where: { $0.id == id }) { p.blocks[i].included = value } } }
@@ -66,12 +84,18 @@ final class MangaModel: ObservableObject {
             p.blocks[i].text += " " + next.text
             p.blocks[i].original += "\n" + next.original
             p.blocks[i].box = p.blocks[i].box.union(next.box)
+            if let translation = next.translation {
+                if p.blocks[i].translation != nil { p.blocks[i].translation?.text += " " + translation.text }
+                else { p.blocks[i].translation = translation }
+            }
             if !next.warning.isEmpty { p.blocks[i].warning += " " + next.warning }
         }
     }
     func delete(_ id: UUID) { edit { $0.blocks.removeAll { $0.id == id } }; selectedBlock = nil }
     func undo() {
-        guard !busy, let c = undoHistory.popLast() else { return }
+        guard !busy, var c = undoHistory.popLast() else { return }
+        // Browser drafts are edited independently of page undo history.
+        c.browserTranslation = chapter?.browserTranslation
         chapter = c; unsaved = true; _ = save(); status = "Последняя правка отменена"
     }
     func markReviewed() {
@@ -114,6 +138,7 @@ final class MangaModel: ObservableObject {
             if var c = chapter, let i = c.pages.firstIndex(where: { $0.file == file }) {
                 undoHistory.append(c)
                 c.pages[i].blocks.append(block)
+                c.pages[i].translationReviewed = false
                 c.pages[i].reviewed = false
                 chapter = c; unsaved = true
                 if save() { status = "Облачко добавлено на страницу \(file). Проверьте порядок реплик." }
@@ -121,13 +146,80 @@ final class MangaModel: ObservableObject {
             }
         }
     }
+    func translationText(_ id: UUID, value: String) {
+        guard !busy, let i = pageIndex, var c = chapter,
+              let b = c.pages[i].blocks.firstIndex(where: { $0.id == id }) else { return }
+        undoHistory.append(c); if undoHistory.count > 80 { undoHistory.removeFirst() }
+        let previous = c.pages[i].blocks[b].translation
+        c.pages[i].blocks[b].translation = TranslationRecord(text:value,
+            source:previous?.source ?? c.pages[i].blocks[b].text,
+            context:previous?.context ?? ProjectFiles.translationContext(c.pages[i],glossary:c.glossary),
+            model:previous?.model ?? "manual")
+        c.pages[i].translationReviewed = false
+        chapter = c; unsaved = true; if save() { status = "Перевод сохранён" }
+    }
+    func markTranslationReviewed() {
+        guard !busy, let i = pageIndex, var c = chapter else { return }
+        let included = c.pages[i].blocks.filter(\.included)
+        guard !included.isEmpty, included.allSatisfy({ !($0.translation?.text.trimmingCharacters(in:.whitespacesAndNewlines) ?? "").isEmpty }) else {
+            message = "Сначала заполните перевод всех включённых реплик страницы."; return
+        }
+        undoHistory.append(c)
+        let context = ProjectFiles.translationContext(c.pages[i],glossary:c.glossary)
+        for j in c.pages[i].blocks.indices where c.pages[i].blocks[j].included {
+            let source = c.pages[i].blocks[j].text
+            c.pages[i].blocks[j].translation?.source = source
+            c.pages[i].blocks[j].translation?.context = context
+        }
+        c.pages[i].translationReviewed = true; chapter = c; unsaved = true; _ = save()
+    }
+    func beginBrowserTranslation() {
+        guard !busy, let c = chapter, save() else { return }
+        guard c.pages.contains(where: { $0.scanned && $0.blocks.contains(where: { $0.included }) }) else {
+            message = "Сначала распознайте страницы главы."; return
+        }
+        browserPart = 0; showBrowserTranslation = true
+    }
+    func copyAndOpenYandex() {
+        let parts = browserParts
+        guard parts.indices.contains(browserPart) else { return }
+        NSPasteboard.general.clearContents()
+        guard NSPasteboard.general.setString(parts[browserPart], forType: .string) else {
+            message = "Не удалось скопировать текст. Попробуйте ещё раз."; return
+        }
+        if NSWorkspace.shared.open(URL(string:"https://translate.yandex.ru/?source_lang=en&target_lang=ru")!) {
+            status = "Английский текст скопирован. Вставьте его в Яндекс Переводчик: ⌘V."
+        } else { message = "Текст скопирован, но браузер не открылся. Откройте translate.yandex.ru и вставьте текст: ⌘V." }
+    }
+    func setBrowserTranslation(_ text: String) {
+        guard chapter != nil else { return }
+        chapter?.browserTranslation = text; unsaved = true; _ = save()
+    }
+    func appendBrowserTranslation() {
+        guard let text = NSPasteboard.general.string(forType: .string), !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            message = "В буфере обмена нет текста. Скопируйте русский перевод в браузере."; return
+        }
+        let previous = chapter?.browserTranslation ?? ""
+        setBrowserTranslation(previous + (previous.isEmpty ? "" : "\n\n") + text)
+    }
+    func exportBrowserTranslation() {
+        guard let c = chapter, let text = c.browserTranslation,
+              !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, save() else { return }
+        let panel = NSSavePanel(); panel.allowedContentTypes = [.plainText]
+        panel.nameFieldStringValue = c.name + "_ru.txt"; panel.directoryURL = folder
+        panel.prompt = "Сохранить RU TXT"
+        if panel.runModal() == .OK, let url = panel.url {
+            do { try text.write(to: url, atomically: true, encoding: .utf8); status = "Сохранено: \(url.lastPathComponent)" }
+            catch { message = "Не удалось сохранить перевод. \(error.localizedDescription)" }
+        }
+    }
     func export() {
         guard !busy, let c = chapter, save() else { return }
         let panel = NSSavePanel(); panel.allowedContentTypes = [.plainText]
-        panel.nameFieldStringValue = c.name + ".txt"; panel.directoryURL = folder
+        panel.nameFieldStringValue = c.name + (exportMode == .original ? "" : exportMode == .translated ? "_ru_blocks" : "_en-ru") + ".txt"; panel.directoryURL = folder
         panel.prompt = "Сохранить TXT"
         if panel.runModal() == .OK, let url = panel.url {
-            do { try ProjectFiles.transcript(c).write(to:url,atomically:true,encoding:.utf8); status = "Сохранено: \(url.lastPathComponent)" }
+            do { try ProjectFiles.transcript(c,mode:exportMode).write(to:url,atomically:true,encoding:.utf8); status = "Сохранено: \(url.lastPathComponent)" }
             catch { message = "Не удалось сохранить TXT. \(error.localizedDescription)" }
         }
     }

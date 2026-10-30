@@ -9,3 +9,5 @@ xcrun swiftc -O -swift-version 5 App/Core.swift App/Model.swift Tests/ModelTests
 if [[ "${INKFLOW_PRIVATE_SAMPLES:-0}" == "1" ]]; then
     python3 scripts/evaluate.py
 fi
+xcrun swiftc -O App/Core.swift Tests/BrowserTranslationTests.swift -o bin/browser-translation-tests
+./bin/browser-translation-tests

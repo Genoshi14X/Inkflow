@@ -48,12 +48,17 @@ struct MainView: View {
                     .resizable().frame(width:40,height:40)
                 VStack(alignment:.leading) {
                     Text(model.chapter?.name ?? "Inkflow").font(.headline)
-                    Text("Манга → текст · полностью локально").font(.caption).foregroundStyle(.secondary)
+                    Text("OCR локально · перевод в браузере").font(.caption).foregroundStyle(.secondary)
                 }
                 Spacer()
                 Button("Открыть папку…",action:model.chooseFolder).disabled(model.busy)
                 if model.busy { Button("Остановить",action:model.stop) }
                 else { Button("Распознать главу") { model.scanAll() }.disabled(model.chapter == nil).buttonStyle(.borderedProminent) }
+                Button("Яндекс Переводчик…", action:model.beginBrowserTranslation)
+                    .disabled(model.chapter == nil || model.busy)
+                Picker("TXT",selection:$model.exportMode) {
+                    ForEach(ExportMode.allCases) { mode in Text(mode.rawValue).tag(mode) }
+                }.frame(width:145).disabled(model.busy)
                 Button("Экспорт TXT…",action:model.export).disabled(model.chapter == nil || model.busy)
             }.padding(16)
             Divider()
@@ -83,6 +88,33 @@ struct MainView: View {
         .alert("Не удалось завершить действие",isPresented:Binding(get:{ model.message != nil },set:{ if !$0 { model.message = nil } })) {
             Button("Закрыть",role:.cancel) { model.message = nil }
         } message: { Text(model.message ?? "") }
+        .sheet(isPresented:$model.showBrowserTranslation) {
+            VStack(alignment:.leading,spacing:14) {
+                Text("Перевод главы в Яндексе").font(.title2.bold())
+                Text("1. Скопируйте оригинал и вставьте его в левое поле браузера: ⌘V. Яндекс переведёт текст онлайн с английского на русский.").foregroundStyle(.secondary)
+                HStack {
+                    Picker("Часть", selection:$model.browserPart) {
+                        ForEach(Array(model.browserParts.indices), id: \.self) { i in
+                            Text("\(i + 1) из \(model.browserParts.count)").tag(i)
+                        }
+                    }.frame(width:170)
+                    Button("Скопировать EN и открыть Яндекс", action:model.copyAndOpenYandex)
+                }
+                Text("Для длинной главы переводите части по очереди. Перед вставкой новой части очистите левое поле Яндекса.").font(.caption).foregroundStyle(.secondary)
+                Text("2. Скопируйте русский результат в браузере и добавьте его сюда. Здесь можно исправить текст перед сохранением.")
+                Button("Добавить перевод из буфера", action:model.appendBrowserTranslation)
+                TextEditor(text:Binding(get:{ model.chapter?.browserTranslation ?? "" },set:{ model.setBrowserTranslation($0) }))
+                    .font(.body).frame(height:260).border(Color.secondary.opacity(0.3))
+                Text("Черновик сохраняется с главой. После правок оригинала обновите перевод вручную; к отдельным облачкам он не привязан.").font(.caption).foregroundStyle(.secondary)
+                HStack {
+                    Button("Закрыть") { model.showBrowserTranslation = false }
+                    Spacer()
+                    Button("Сохранить RU TXT…", action:model.exportBrowserTranslation)
+                        .disabled((model.chapter?.browserTranslation ?? "").trimmingCharacters(in:.whitespacesAndNewlines).isEmpty)
+                        .buttonStyle(.borderedProminent)
+                }
+            }.padding(24).frame(width:650)
+        }
         .onChange(of:model.selectedPage) { _ in model.selectedBlock = nil; model.adding = false }
     }
     var sidebar: some View {
@@ -129,7 +161,12 @@ struct MainView: View {
                 Button { model.markReviewed() } label: {
                     Label(p.reviewed ? "Страница проверена" : "Отметить как проверенную",systemImage:p.reviewed ? "checkmark.circle.fill" : "checkmark.circle")
                         .frame(maxWidth:.infinity)
-                }.disabled(model.busy || !p.scanned).padding(12)
+                }.disabled(model.busy || !p.scanned).padding(.horizontal,12)
+                if p.blocks.contains(where:{ $0.translation != nil }) {
+                    Button(p.translationReviewed == true ? "Перевод проверен" : "Отметить перевод как проверенный") { model.markTranslationReviewed() }
+                        .frame(maxWidth:.infinity).disabled(model.busy).padding(.horizontal,12)
+                }
+                Spacer().frame(height:4)
             } else { Spacer() }
         }.background(Color(nsColor:.controlBackgroundColor))
     }
@@ -155,8 +192,17 @@ struct BlockCard: View {
                     Button("Удалить блок") { model.delete(block.id) }
                 } label: { Image(systemName:"ellipsis") }.menuStyle(.borderlessButton).frame(width:24)
             }
-            TextEditor(text:Binding(get:{ block.text },set:{ model.text(block.id,value:$0) }))
+            TextEditor(text:model.textBinding(block.id))
                 .font(.system(size:14)).frame(minHeight:64,idealHeight:CGFloat(min(155,max(64,block.text.count/35*20+28)))).scrollContentBackground(.hidden)
+            if model.exportMode != .original || block.translation != nil {
+                Text("РУССКИЙ ПЕРЕВОД · ЧЕРНОВИК").font(.caption2.bold()).foregroundStyle(.secondary)
+                TextEditor(text:model.textBinding(block.id,translated:true))
+                    .font(.system(size:14)).frame(height:85).scrollContentBackground(.hidden)
+                if let ru = block.translation, let page = model.page,
+                   ru.source != block.text || ru.context != ProjectFiles.translationContext(page,glossary:model.chapter?.glossary) {
+                    Text("Оригинал, порядок или словарь изменились — проверьте перевод.").font(.caption2).foregroundStyle(.orange)
+                }
+            }
             if !block.warning.isEmpty { Label(block.warning,systemImage:"exclamationmark.triangle").font(.caption2).foregroundStyle(.orange) }
             if showOriginal { Text(block.original).font(.caption.monospaced()).foregroundStyle(.secondary).textSelection(.enabled) }
         }
