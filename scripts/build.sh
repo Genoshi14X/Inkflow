@@ -4,8 +4,9 @@ cd "$(dirname "$0")/.."
 APP="dist/Inkflow.app"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 ./scripts/build-icon.sh
+cp scripts/heal-image.py "$APP/Contents/Resources/heal-image.py"
 cp bin/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
-xcrun swiftc -O -swift-version 5 -target arm64-apple-macosx13.0 App/Core.swift App/Model.swift App/Inkflow.swift -o "$APP/Contents/MacOS/Inkflow"
+xcrun swiftc -O -swift-version 5 -target arm64-apple-macosx13.0 App/Core.swift App/Upscale.swift App/Healing.swift App/TextLayers.swift App/Model.swift App/Inkflow.swift -o "$APP/Contents/MacOS/Inkflow"
 cat > "$APP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

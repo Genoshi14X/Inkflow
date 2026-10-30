@@ -37,11 +37,42 @@ struct TextBlock: Codable, Identifiable, Sendable {
     var panel: Int = 0
     var translation: TranslationRecord? = nil
 }
+enum TextAlignment: String, Codable, CaseIterable, Sendable {
+    case left = "Слева", center = "По центру", right = "Справа"
+}
+struct TextLayer: Codable, Identifiable, Sendable {
+    var id = UUID()
+    var text = "Новый текст"
+    var box = Box(x:0.3,y:0.3,width:0.4,height:0.2)
+    var fontName = "Helvetica"
+    // Width-relative typography scales with both the viewport and image upscaling.
+    var fontScale = 0.04
+    var heightScale = 1.0
+    var lineSpacing = 0.0
+    var letterSpacing = 0.0
+    var alignment: TextAlignment = .center
+    var verticallyCentered = true
+    var red = 0.0
+    var green = 0.0
+    var blue = 0.0
+    var visible = true
+    // Optional so projects created before character styling keep their original font face.
+    var bold: Bool? = nil
+    var italic: Bool? = nil
+    var underline: Bool? = nil
+    var strikethrough: Bool? = nil
+    var uppercase: Bool? = nil
+    var widthScale: Double? = nil
+}
 struct ScanPage: Codable, Identifiable, Sendable {
     var id: String { file }
     var file: String
+    // Active image relative to the chapter folder; nil uses the original file.
+    var imageFile: String? = nil
+    var imagePath: String { imageFile ?? file }
     var width: Int = 0
     var height: Int = 0
+    var textLayers: [TextLayer]? = nil
     var blocks: [TextBlock] = []
     var panels: [Box] = []
     var scanned = false
@@ -99,7 +130,11 @@ enum ProjectFiles {
         return Chapter(name: folder.lastPathComponent, pages: urls.map { url in
             let key = fingerprint(url)
             if var old = previous[url.lastPathComponent] {
-                if old.fingerprint != key {
+                let active = folder.appendingPathComponent(old.imagePath)
+                if !FileManager.default.fileExists(atPath: active.path) {
+                    old.error = "Рабочее изображение отсутствует. Восстановите файл: \(old.imagePath)"
+                    old.reviewed = false
+                } else if old.fingerprint != fingerprint(active) {
                     // Preserve edits; changed sources must never silently erase them.
                     old.error = "Файл изображения изменился. Сохранённые реплики оставлены; проверьте их по новой странице."
                     old.reviewed = false

@@ -5,6 +5,7 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate {
     weak var model: MangaModel?
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         if let model, !model.save() { return .terminateCancel }
+        model?.stopUpscaleOnExit()
         return .terminateNow
     }
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
@@ -115,7 +116,7 @@ struct MainView: View {
                 }
             }.padding(24).frame(width:650)
         }
-        .onChange(of:model.selectedPage) { _ in model.selectedBlock = nil; model.adding = false }
+        .onChange(of:model.selectedPage) { _ in model.selectedBlock = nil; model.adding = false; model.healing = false; model.selectedTextLayer = nil }
     }
     var sidebar: some View {
         VStack(alignment:.leading,spacing:0) {
@@ -135,6 +136,20 @@ struct MainView: View {
         }
     }
     var inspector: some View {
+        VStack(spacing:0) {
+            Picker("Панель",selection:$model.textEditing) {
+                Text("Реплики").tag(false)
+                Text("Текст на странице").tag(true)
+            }.pickerStyle(.segmented).padding(12)
+            if model.textEditing { TextLayerInspector(model:model) }
+            else { ocrInspector }
+        }
+        .onChange(of:model.textEditing) { active in
+            if active { model.healing = false; model.adding = false; model.selectedBlock = nil }
+            else { model.selectedTextLayer = nil }
+        }
+    }
+    var ocrInspector: some View {
         VStack(alignment:.leading,spacing:12) {
             HStack {
                 Text("Реплики").font(.title3.bold()); Spacer()
@@ -221,13 +236,45 @@ struct PageView: View {
     var body: some View {
         VStack(spacing:0) {
             HStack {
-                Button(model.adding ? "Отменить выделение" : "Добавить облачко") { model.adding.toggle() }.disabled(model.busy || model.page?.scanned != true)
+                Button(model.adding ? "Отменить выделение" : "Добавить облачко") { model.adding.toggle(); model.healing = false; model.textEditing = false }.disabled(model.busy || model.page?.scanned != true)
+                Button("Апскейл папки ×2", action:model.upscale).disabled(model.busy || model.chapter == nil)
                 Toggle("Панели",isOn:$model.showPanels).toggleStyle(.checkbox).font(.caption)
                 Spacer()
                 Button { model.zoom = max(1,model.zoom-0.25) } label: { Image(systemName:"minus.magnifyingglass") }
                 Text("\(Int(model.zoom*100))%").font(.caption.monospacedDigit()).frame(width:40)
                 Button { model.zoom = min(3,model.zoom+0.25) } label: { Image(systemName:"plus.magnifyingglass") }
             }.padding(10)
+            HStack(spacing:10) {
+                Button(model.healing ? "Завершить ретушь" : "Кисть восстановления") {
+                    model.healing.toggle(); model.adding = false; model.textEditing = false; model.selectedBlock = nil
+                }.disabled(model.busy || model.imageURL == nil)
+                if !model.healing {
+                    Button("Добавить текст",action:model.addTextLayer).disabled(model.busy || model.imageURL == nil)
+                }
+                if model.healing {
+                    Text("Размер").font(.caption)
+                    Slider(value:$model.brushDiameter,in:4...240,step:2).frame(minWidth:65,maxWidth:150)
+                    Text("\(Int(model.brushDiameter)) px").font(.caption.monospacedDigit()).frame(width:48)
+                    Button { model.undo() } label: { Image(systemName:"arrow.uturn.backward") }
+                        .help("Отменить мазок или последнюю правку").disabled(model.busy || model.undoHistory.isEmpty)
+                }
+                Spacer(minLength:0)
+                Button {
+                    if let url = model.imageURL { NSWorkspace.shared.activateFileViewerSelecting([url]) }
+                } label: { Image(systemName:"folder") }.help("Показать рабочее изображение в Finder")
+                    .disabled(model.imageURL == nil)
+            }.padding(.horizontal,10).padding(.bottom,8)
+            if model.healing {
+                Picker("Восстановление",selection:$model.healingMethod) {
+                    Text("Сохранять текстуру").tag("texture")
+                    Text("Сглаживать").tag("smooth")
+                }.pickerStyle(.segmented).labelsHidden().disabled(model.busy)
+                    .padding(.horizontal,10).padding(.bottom,8)
+            }
+            if model.healing {
+                Text("Закрасьте текст целиком, захватив немного фона. Отпустите мышь, чтобы восстановить участок.")
+                    .font(.caption).foregroundStyle(.secondary).padding(.horizontal,10).padding(.bottom,8)
+            }
             if model.adding { Text("Обведите одно облачко мышью. Новая реплика появится в конце списка.").font(.caption).foregroundStyle(.blue).padding(.bottom,8) }
             GeometryReader { geo in
                 if let url = model.imageURL, let nsImage = NSImage(contentsOf:url) {
@@ -236,7 +283,7 @@ struct PageView: View {
                     ScrollView([.horizontal,.vertical]) {
                         ZStack(alignment:.topLeading) {
                             Image(nsImage:nsImage).resizable().frame(width:width,height:height)
-                            if model.showPanels {
+                            if model.showPanels && !model.healing && !model.textEditing {
                                 ForEach(Array((model.page?.panels ?? []).enumerated()),id:\.offset) { i,box in
                                     Rectangle().stroke(Color.green.opacity(0.8),style:StrokeStyle(lineWidth:2,dash:[6,4]))
                                         .overlay(alignment:.bottomLeading) { Text("П\(i+1)").font(.caption2).padding(3).background(.green).foregroundStyle(.white) }
@@ -252,7 +299,15 @@ struct PageView: View {
                                     .contentShape(Rectangle())
                                     .onTapGesture { model.selectedBlock = b.id }
                                     .offset(x:b.box.x*width,y:b.box.y*height)
-                                    .allowsHitTesting(!model.adding)
+                                    .allowsHitTesting(!model.adding && !model.healing && !model.textEditing)
+                                    .opacity(model.healing || model.textEditing ? 0 : 1)
+                            }
+                            TextLayersCanvas(model:model).frame(width:width,height:height).id(model.page?.file)
+                            if model.healing {
+                                HealingCanvas(diameter:model.brushDiameter * width / Double(UpscaleJob.dimensions(url)?.0 ?? 1),
+                                    canvasSize:CGSize(width:width,height:height)) { points in model.heal(points) }
+                                    .frame(width:width,height:height).id(url.path)
+                                    .allowsHitTesting(!model.busy)
                             }
                             if model.adding {
                                 Color.clear.contentShape(Rectangle()).frame(width:width,height:height)
@@ -274,5 +329,51 @@ struct PageView: View {
                 } else { Text("Не удалось показать изображение.").foregroundStyle(.secondary).frame(maxWidth:.infinity,maxHeight:.infinity) }
             }
         }.background(Color(nsColor:.underPageBackgroundColor))
+    }
+}
+
+
+// The stroke lives in image coordinates, independent of scroll position and zoom.
+struct HealingCanvas: View {
+    let diameter: Double
+    let canvasSize: CGSize
+    let apply: ([BrushPoint]) -> Void
+    @State private var points: [CGPoint] = []
+    @State private var hover: CGPoint? = nil
+
+    private func clamped(_ point: CGPoint) -> CGPoint {
+        CGPoint(x:max(0,min(canvasSize.width,point.x)),y:max(0,min(canvasSize.height,point.y)))
+    }
+    var body: some View {
+        ZStack(alignment:.topLeading) {
+            Color.clear
+            Path { path in
+                if points.count == 1, let p = points.first {
+                    path.addEllipse(in:CGRect(x:p.x-diameter/2,y:p.y-diameter/2,width:diameter,height:diameter))
+                } else if let first = points.first {
+                    path.move(to:first)
+                    for point in points.dropFirst() { path.addLine(to:point) }
+                }
+            }
+            .stroke(Color.pink.opacity(0.55),style:StrokeStyle(lineWidth:points.count == 1 ? 1 : diameter,lineCap:.round,lineJoin:.round))
+            if let hover {
+                Circle().stroke(Color.white,lineWidth:2).overlay(Circle().stroke(Color.black,lineWidth:1))
+                    .frame(width:diameter,height:diameter).position(hover)
+            }
+        }
+        .clipped().contentShape(Rectangle())
+        .onContinuousHover { phase in
+            switch phase { case .active(let location): hover = clamped(location); case .ended: hover = nil }
+        }
+        .gesture(DragGesture(minimumDistance:0).onChanged { value in
+            let p = clamped(value.location)
+            if points.isEmpty { points.append(clamped(value.startLocation)) }
+            if points.last != p { points.append(p) }
+            hover = p
+        }.onEnded { value in
+            if points.isEmpty { points = [clamped(value.location)] }
+            let stroke = points.map { BrushPoint(x:$0.x/canvasSize.width,y:$0.y/canvasSize.height) }
+            points = []; apply(stroke)
+        })
     }
 }
