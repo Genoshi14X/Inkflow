@@ -101,6 +101,8 @@ struct TranslationImportPlan: Identifiable {
         let sourceChanged: Bool
         let hidden: Bool
         let newLayer: TextLayer?
+        let fontName: String
+        let hasFontOverrides: Bool
     }
     let id = UUID()
     let document: TranslationDocument
@@ -109,8 +111,8 @@ struct TranslationImportPlan: Identifiable {
     let missing: [TranslationKey]
     var pageCount: Int { Set(items.map { $0.key.page }).count }
     var conflicts: Int { items.filter(\.conflict).count }
-    func applicable(_ policy: TranslationImportPolicy) -> [Item] {
-        items.filter { !$0.unchanged && (policy == .replaceExisting || !$0.conflict) }
+    func applicable(_ policy: TranslationImportPolicy, fontName: String? = nil) -> [Item] {
+        items.filter { (!$0.unchanged || (fontName != nil && (fontName != $0.fontName || $0.hasFontOverrides))) && (policy == .replaceExisting || !$0.conflict) }
     }
 }
 
@@ -177,18 +179,18 @@ enum TranslationImporter {
             if !oldRU.isEmpty && oldRU != entry.text { previous.append("Перевод OCR: " + oldRU) }
             items.append(.init(key:entry.key,pageIndex:p,blockID:block.id,layerID:layer.id,text:entry.text,
                 previous:previous.joined(separator:"\n"),conflict:conflict,unchanged:unchanged,
-                sourceChanged:block.text != anchor.source,hidden:!layer.visible,newLayer:newLayer))
+                sourceChanged:block.text != anchor.source,hidden:!layer.visible,newLayer:newLayer,fontName:layer.fontName,hasFontOverrides:layer.bold != nil || layer.italic != nil))
         }
         let imported = Set(document.entries.map(\.key))
         let missing = map.entries.map { TranslationKey(page:$0.page,number:$0.number) }.filter { !imported.contains($0) }
         return TranslationImportPlan(document:document,map:map,items:items,missing:missing)
     }
-    static func applying(_ original: TranslationImportPlan, to chapter: Chapter, policy: TranslationImportPolicy, allowPartial: Bool) throws -> (Chapter, [TranslationImportPlan.Item]) {
+    static func applying(_ original: TranslationImportPlan, to chapter: Chapter, policy: TranslationImportPolicy, allowPartial: Bool, fontName: String? = nil) throws -> (Chapter, [TranslationImportPlan.Item]) {
         // Resolve IDs again so a stale preview can never write to a different layer.
         let plan = try self.plan(document:original.document,map:original.map,chapter:chapter)
         guard plan.missing.isEmpty || allowPartial else { throw TranslationImportError("В TXT отсутствует часть реплик. Подтвердите частичный импорт в окне проверки.") }
         var updated = chapter
-        let items = plan.applicable(policy)
+        let items = plan.applicable(policy,fontName:fontName)
         for item in items {
             let p = item.pageIndex
             if let newLayer = item.newLayer {
@@ -197,6 +199,11 @@ enum TranslationImporter {
             }
             guard let l = updated.pages[p].textLayers?.firstIndex(where:{ $0.id == item.layerID }),
                   let b = updated.pages[p].blocks.firstIndex(where:{ $0.id == item.blockID }) else { throw ScanError.missingAnchor }
+            if let fontName {
+                updated.pages[p].textLayers![l].fontName = fontName
+                updated.pages[p].textLayers![l].bold = nil
+                updated.pages[p].textLayers![l].italic = nil
+            }
             updated.pages[p].textLayers![l].text = item.text
             updated.pages[p].textLayers![l].anchorEdited = true
             let context = ProjectFiles.translationContext(updated.pages[p],glossary:updated.glossary)

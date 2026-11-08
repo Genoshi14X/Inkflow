@@ -20,6 +20,9 @@ final class MangaModel: ObservableObject {
     @Published var brushDiameter = 40.0
     @Published var showPanels = false
     @Published var zoom = 1.0
+    @Published var autoCleanAfterExport = UserDefaults.standard.object(forKey:"autoCleanAfterTXT") as? Bool ?? true {
+        didSet { UserDefaults.standard.set(autoCleanAfterExport,forKey:"autoCleanAfterTXT") }
+    }
     @Published var exportMode: ExportMode = .original
     @Published var showBrowserTranslation = false
     @Published var browserPart = 0
@@ -32,6 +35,7 @@ final class MangaModel: ObservableObject {
     }
     @Published var undoHistory: [Chapter] = []
     private var healingJob: HealingJob?
+    private var cleaningJob: HealingJob?
     private var upscaleJob: UpscaleJob?
     private var stopRequested = false
     private var unsaved = false
@@ -142,7 +146,7 @@ final class MangaModel: ObservableObject {
         if !layer.text.isEmpty { return layer.text.replacingOccurrences(of:"\n",with:" ") }
         return sourceCaption(for:layer).map { "Место перевода " + $0 } ?? "Пустой слой"
     }
-    func exportTXT(to url: URL) throws {
+    func exportTXT(to url: URL, cleaningPython: URL? = nil, cleaningScript: URL? = nil) throws {
         guard prepareTranslationLayers(), let chapter, let folder else {
             throw ScanError.missingAnchor
         }
@@ -167,6 +171,7 @@ final class MangaModel: ObservableObject {
             else { try? FileManager.default.removeItem(at:mapURL) }
             throw error
         }
+        if autoCleanAfterExport { cleanDetectedText(python:cleaningPython,script:cleaningScript) }
     }
     func translationImportPlan(txt: URL, map: URL) throws -> TranslationImportPlan {
         guard !busy, let chapter else { throw TranslationImportError("Откройте главу и дождитесь завершения обработки.") }
@@ -211,11 +216,12 @@ final class MangaModel: ObservableObject {
             }
         } catch { message = error.localizedDescription }
     }
-    @discardableResult func commitTranslationImport(_ plan: TranslationImportPlan, policy: TranslationImportPolicy, allowPartial: Bool) throws -> Int {
+    @discardableResult func commitTranslationImport(_ plan: TranslationImportPlan, policy: TranslationImportPolicy, allowPartial: Bool, fontName: String? = nil) throws -> Int {
         guard !busy, let previous = chapter, let folder, save() else {
             throw TranslationImportError(message ?? "Не удалось подготовить проект к импорту.")
         }
-        let (updated,items) = try TranslationImporter.applying(plan,to:previous,policy:policy,allowPartial:allowPartial)
+        if let fontName, NSFont(name:fontName,size:12) == nil { throw TranslationImportError("Выбранный шрифт недоступен. Выберите установленный шрифт.") }
+        let (updated,items) = try TranslationImporter.applying(plan,to:previous,policy:policy,allowPartial:allowPartial,fontName:fontName)
         guard !items.isEmpty else { return 0 }
         // Publish and record undo only after the whole updated project is saved successfully.
         try ProjectFiles.save(updated,to:folder)
@@ -227,9 +233,9 @@ final class MangaModel: ObservableObject {
         status = "Импортировано реплик: \(items.count). Проверьте расположение и размер текста."
         return items.count
     }
-    func finishTranslationImport(_ plan: TranslationImportPlan, policy: TranslationImportPolicy, allowPartial: Bool) {
+    func finishTranslationImport(_ plan: TranslationImportPlan, policy: TranslationImportPolicy, allowPartial: Bool, fontName: String? = nil) {
         do {
-            try commitTranslationImport(plan,policy:policy,allowPartial:allowPartial)
+            try commitTranslationImport(plan,policy:policy,allowPartial:allowPartial,fontName:fontName)
             pendingTranslationImport = nil
         } catch {
             pendingTranslationImport = nil
@@ -242,6 +248,39 @@ final class MangaModel: ObservableObject {
         let protected = chapter?.pages.flatMap { [$0.file,$0.imagePath] }.map { folder!.appendingPathComponent($0).standardizedFileURL.resolvingSymlinksInPath() } ?? []
         guard !protected.contains(destination) else { throw UpscaleFailure("Выберите другое имя, чтобы сохранить исходник и рабочие изображения.") }
         try TextRenderer.export(image:input,layers:page.textLayers ?? [],to:output)
+    }
+    private(set) var lastBatchExportURL: URL?
+    func saveAllPages(to output: URL, reveal: Bool = false) {
+        guard !busy, let chapter, let folder, save() else { return }
+        busy = true; stopRequested = false; lastBatchExportURL = nil
+        Task { @MainActor in
+            defer { busy = false }
+            do {
+                let run = try PageExportRun(chapter:chapter,source:folder,output:output)
+                for index in chapter.pages.indices {
+                    await Task.yield()
+                    if stopRequested { status = "Сохранение остановлено. Готовая папка не создана."; return }
+                    status = "Сохранение PNG: \(index+1) из \(chapter.pages.count)…"
+                    try run.exportPage(index)
+                }
+                await Task.yield()
+                if stopRequested { status = "Сохранение остановлено. Готовая папка не создана."; return }
+                let destination = try run.complete()
+                lastBatchExportURL = destination
+                status = "Сохранено страниц: \(chapter.pages.count). Папка: \(destination.lastPathComponent)"
+                if reveal { NSWorkspace.shared.activateFileViewerSelecting([destination]) }
+            } catch { message = error.localizedDescription; status = "Не удалось сохранить все страницы." }
+        }
+    }
+    func chooseAllPNGExport() {
+        guard !busy, chapter != nil, save() else { return }
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false; panel.canChooseDirectories = true
+        panel.canCreateDirectories = true; panel.allowsMultipleSelection = false
+        panel.prompt = "Сохранить страницы"
+        panel.message = "Выберите папку. Inkflow создаст внутри новую папку со всеми страницами PNG и видимыми текстовыми слоями."
+        panel.directoryURL = folder
+        if panel.runModal() == .OK, let url = panel.url { saveAllPages(to:url,reveal:true) }
     }
     func choosePNGExport() {
         guard !busy, let page, save() else { return }
@@ -282,6 +321,7 @@ final class MangaModel: ObservableObject {
             let next = p.blocks.remove(at:i+1)
             p.blocks[i].text += " " + next.text
             p.blocks[i].original += "\n" + next.original
+            p.blocks[i].ocrLines = (p.blocks[i].ocrLines ?? [p.blocks[i].box]) + (next.ocrLines ?? [next.box])
             p.blocks[i].box = p.blocks[i].box.union(next.box)
             if let translation = next.translation {
                 if p.blocks[i].translation != nil { p.blocks[i].translation?.text += " " + translation.text }
@@ -302,6 +342,12 @@ final class MangaModel: ObservableObject {
         undoHistory.append(c); c.pages[i].reviewed.toggle(); chapter = c; unsaved = true; _ = save()
     }
     func stop() {
+        if let job = cleaningJob {
+            stopRequested = true
+            if job.process.isRunning { job.process.terminate() }
+            status = "Остановка очистки текста…"
+            return
+        }
         if let job = healingJob {
             stopRequested = true
             if job.process.isRunning { job.process.terminate() }
@@ -394,6 +440,86 @@ final class MangaModel: ObservableObject {
     func stopUpscaleOnExit() {
         if let job = upscaleJob, job.process.isRunning { job.process.terminate() }
         if let job = healingJob, job.process.isRunning { job.process.terminate() }
+        if let job = cleaningJob, job.process.isRunning { job.process.terminate() }
+    }
+
+    func cleanDetectedText(python overridePython: URL? = nil, script overrideScript: URL? = nil) {
+        guard !busy, let source = chapter, let folder, save() else { return }
+        let eligible = source.pages.indices.filter { source.pages[$0].scanned && source.pages[$0].blocks.contains { $0.included && !$0.text.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty } }
+        let pending = eligible.filter { index in
+            let page = source.pages[index]
+            let actual = ProjectFiles.fingerprint(folder.appendingPathComponent(page.imagePath))
+            return page.autoCleanSignature != (try? TextCleaningConfiguration(page:page).signature(imageFingerprint:actual))
+        }
+        guard !pending.isEmpty else {
+            status = eligible.isEmpty ? "TXT сохранён. Нет распознанных областей для очистки." : "TXT сохранён. Эти области уже очищены; изображения не изменены."
+            return
+        }
+        let stored = UserDefaults.standard.string(forKey:"nunifPython").map { URL(fileURLWithPath:$0) }
+        let candidates = [overridePython, stored,
+            FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Downloads/nunif/.venv/bin/python"),
+            FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Downloads/nunif/venv/bin/python")]
+        guard let python = candidates.compactMap({ $0 }).first(where:{ FileManager.default.isExecutableFile(atPath:$0.path) }),
+              let script = overrideScript ?? Bundle.main.url(forResource:"clean-text",withExtension:"py") else {
+            status = "TXT сохранён. Очистка не запущена."
+            message = "TXT и карта сохранены. Для очистки нужен Python с OpenCV и Pillow, выбранный для nunif, и обновлённая сборка Inkflow."
+            return
+        }
+        let run = "cleaned/" + UUID().uuidString
+        let directory = folder.appendingPathComponent(run,isDirectory:true)
+        busy = true; stopRequested = false; adding = false
+        status = "TXT сохранён. Подготовка очистки текста…"
+        Task {
+            var published = false
+            defer {
+                cleaningJob = nil; busy = false
+                if !published { try? FileManager.default.removeItem(at:directory) }
+            }
+            var updated = source
+            var totalSmooth = 0, totalTexture = 0, totalSkipped = 0, changedPages = 0
+            do {
+                for (number,index) in pending.enumerated() {
+                    if stopRequested { status = "Очистка остановлена. TXT сохранён; рабочие изображения не изменены."; return }
+                    let page = source.pages[index]
+                    let input = folder.appendingPathComponent(page.imagePath)
+                    // OCR geometry must still describe this working image.
+                    guard page.error == nil, page.fingerprint == ProjectFiles.fingerprint(input) else {
+                        throw UpscaleFailure("Страница \(page.file) изменилась или недоступна. Проверьте её перед очисткой.")
+                    }
+                    let config = TextCleaningConfiguration(page:page)
+                    let relative = run + "/" + String(format:"%04d.png",index+1)
+                    let output = folder.appendingPathComponent(relative)
+                    status = "Очистка текста: \(number+1) из \(pending.count) · \(page.file)"
+                    let job = try HealingJob(python:python,script:script,input:input,output:output,configuration:JSONEncoder().encode(config))
+                    try job.process.run(); cleaningJob = job
+                    let failure = await Task.detached(priority:.userInitiated) { () -> String? in
+                        do { try job.finish(); return nil } catch { return error.localizedDescription }
+                    }.value
+                    cleaningJob = nil
+                    if stopRequested { status = "Очистка остановлена. TXT сохранён; рабочие изображения не изменены."; return }
+                    if let failure { throw UpscaleFailure("\(page.file): \(failure)") }
+                    guard let data = job.reportData else { throw UpscaleFailure("Не получен отчёт очистки \(page.file).") }
+                    let report = try JSONDecoder().decode(TextCleaningReport.self,from:data)
+                    totalSmooth += report.smooth; totalTexture += report.texture; totalSkipped += report.skipped
+                    if report.changedPixels > 0 {
+                        updated.pages[index].imageFile = relative
+                        updated.pages[index].fingerprint = ProjectFiles.fingerprint(output)
+                        updated.pages[index].error = nil
+                        changedPages += 1
+                    } else { try FileManager.default.removeItem(at:output) }
+                    updated.pages[index].autoCleanSignature = try config.signature(imageFingerprint:updated.pages[index].fingerprint)
+                }
+                // No page is exposed until the complete chapter and all files are ready.
+                try ProjectFiles.save(updated,to:folder)
+                undoHistory.append(source); if undoHistory.count > 80 { undoHistory.removeFirst() }
+                chapter = updated; unsaved = false
+                published = changedPages > 0
+                status = "TXT сохранён. Очищено страниц: \(changedPages); областей: сглаживание — \(totalSmooth), текстура — \(totalTexture), пропущено — \(totalSkipped). Проверьте результат; очистку можно отменить."
+            } catch {
+                status = "TXT сохранён. Очистка не завершена; рабочие изображения не изменены."
+                message = "Не удалось очистить текст. \(error.localizedDescription) TXT и карта сохранены. Изображения остались прежними."
+            }
+        }
     }
 
     func heal(_ points: [BrushPoint], python overridePython: URL? = nil, script overrideScript: URL? = nil) {
@@ -557,7 +683,7 @@ final class MangaModel: ObservableObject {
         panel.nameFieldStringValue = c.name + (exportMode == .original ? "" : exportMode == .translated ? "_ru_blocks" : "_en-ru") + ".txt"; panel.directoryURL = folder
         panel.prompt = "Сохранить TXT"
         if panel.runModal() == .OK, let url = panel.url {
-            do { try exportTXT(to:url); status = "TXT и карта мест перевода сохранены: \(url.lastPathComponent)" }
+            do { try exportTXT(to:url); if !autoCleanAfterExport { status = "TXT и карта мест перевода сохранены: \(url.lastPathComponent)" } }
             catch { message = "Не удалось сохранить TXT. \(error.localizedDescription)" }
         }
     }

@@ -58,7 +58,9 @@ import Foundation
             fingerprint:ProjectFiles.fingerprint(input))
         legacy.translationReviewed = true
         try ProjectFiles.save(Chapter(name:"155",pages:[legacy],browserTranslation:"Черновик"),to:folder)
-        let model = MangaModel(); model.open(folder)
+        let previousAutoCleanPreference = UserDefaults.standard.object(forKey:"autoCleanAfterTXT")
+        defer { UserDefaults.standard.set(previousAutoCleanPreference,forKey:"autoCleanAfterTXT") }
+        let model = MangaModel(); model.autoCleanAfterExport = false; model.open(folder)
         let expectedTXT = ProjectFiles.transcript(model.chapter!)
         let output = folder.appendingPathComponent("155.txt")
         try model.exportTXT(to:output)

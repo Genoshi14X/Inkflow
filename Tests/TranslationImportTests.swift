@@ -61,6 +61,14 @@ import Foundation
         let history = model.undoHistory.count
         let again = try model.commitTranslationImport(plan,policy:.keepExisting,allowPartial:false)
         precondition(again == 0 && model.undoHistory.count == history,"Repeated import must be idempotent")
+        rejected { _ = try model.commitTranslationImport(plan,policy:.keepExisting,allowPartial:false,fontName:"Missing-Inkflow-Font-123") }
+        precondition(model.page!.textLayers == stored.pages[0].textLayers)
+        let fontCount = try model.commitTranslationImport(plan,policy:.keepExisting,allowPartial:false,fontName:"Helvetica-Oblique")
+        precondition(fontCount == 2 && model.page!.textLayers!.allSatisfy { $0.fontName == "Helvetica-Oblique" && $0.bold == nil && $0.italic == nil })
+        let repeatedFontCount = try model.commitTranslationImport(plan,policy:.keepExisting,allowPartial:false,fontName:"Helvetica-Oblique")
+        precondition(repeatedFontCount == 0)
+        model.undo()
+        precondition(model.page!.textLayers == stored.pages[0].textLayers)
         model.undo(); precondition(model.page!.textLayers == before.pages[0].textLayers && model.page!.blocks.allSatisfy { $0.translation == nil })
         let imageAfter = try Data(contentsOf:image); precondition(imageAfter == Data("untouched pixels".utf8))
         // Missing entries need explicit confirmation and never empty the absent layer.

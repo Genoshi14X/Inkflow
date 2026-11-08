@@ -19,14 +19,18 @@ final class HealingJob: @unchecked Sendable {
     private let input: URL
     private let output: URL
 
-    init(python: URL, script: URL, input: URL, output: URL, stroke: BrushStroke) throws {
+    convenience init(python: URL, script: URL, input: URL, output: URL, stroke: BrushStroke) throws {
+        try self.init(python:python,script:script,input:input,output:output,configuration:JSONEncoder().encode(stroke))
+    }
+    var reportData: Data? { try? Data(contentsOf:URL(fileURLWithPath:result.path + ".json")) }
+    init(python: URL, script: URL, input: URL, output: URL, configuration: Data) throws {
         self.input = input; self.output = output
         temporary = FileManager.default.temporaryDirectory.appendingPathComponent("InkflowHealing-" + UUID().uuidString)
         try FileManager.default.createDirectory(at: temporary, withIntermediateDirectories: true)
         log = temporary.appendingPathComponent("process.log")
         result = temporary.appendingPathComponent("result.png")
         let mask = temporary.appendingPathComponent("stroke.json")
-        try JSONEncoder().encode(stroke).write(to: mask)
+        try configuration.write(to: mask)
         FileManager.default.createFile(atPath: log.path, contents: nil)
         handle = try FileHandle(forWritingTo: log)
         process.currentDirectoryURL = input.deletingLastPathComponent()

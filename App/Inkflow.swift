@@ -35,6 +35,7 @@ struct InkflowApp: App {
                 Button("Сохранить правки") { _ = model.save() }.keyboardShortcut("s")
                 Button("Экспорт TXT…",action:model.export).keyboardShortcut("e").disabled(model.chapter == nil || model.busy)
                 Button("Импорт перевода TXT…",action:model.beginTranslationImport).disabled(model.chapter == nil || model.busy)
+                Button("Сохранить все страницы в PNG…",action:model.chooseAllPNGExport).disabled(model.chapter == nil || model.busy)
             }
             CommandGroup(after:.undoRedo) { Button("Отменить правку Inkflow",action:model.undo).keyboardShortcut("z",modifiers:[.command,.shift]).disabled(model.undoHistory.isEmpty || model.busy) }
         }
@@ -61,7 +62,12 @@ struct MainView: View {
                 Picker("TXT",selection:$model.exportMode) {
                     ForEach(ExportMode.allCases) { mode in Text(mode.rawValue).tag(mode) }
                 }.frame(width:145).disabled(model.busy)
-                Button("Экспорт TXT…",action:model.export).disabled(model.chapter == nil || model.busy)
+                VStack(alignment:.leading,spacing:5) {
+                    Button("Экспорт TXT…",action:model.export).disabled(model.chapter == nil || model.busy)
+                    Toggle("Очистить текст после экспорта",isOn:$model.autoCleanAfterExport)
+                        .font(.caption).disabled(model.busy)
+                        .help("Удалить найденные буквы с рабочих изображений после сохранения TXT. Исходники сохранятся; очистку можно отменить.")
+                }
             }.padding(16)
             Divider()
             if model.chapter != nil {

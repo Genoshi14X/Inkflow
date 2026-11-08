@@ -5,13 +5,15 @@ import sys
 from pathlib import Path
 
 
-def restore_texture(image, mask):
+def restore_texture(image, mask, donor_exclusion=None):
     """Fill from fully unmasked donor patches; never average away the source grain."""
     import cv2
     import numpy as np
 
     unknown = mask > 0
     original_known = (~unknown).astype(np.uint8)
+    if donor_exclusion is not None:
+        original_known[donor_exclusion > 0] = 0
     # Use the largest patch with enough unmasked source material for this crop.
     half = min(7, (min(mask.shape) - 1) // 2)
     while half >= 1:

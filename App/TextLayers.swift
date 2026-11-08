@@ -64,13 +64,36 @@ enum TextRenderer {
         let measured = text.boundingRect(with:CGSize(width:layoutWidth,height:CGFloat.greatestFiniteMagnitude),
             options:[.usesLineFragmentOrigin,.usesFontLeading])
         context.saveGState(); defer { context.restoreGState() }
-        context.clip(to:box)
+        rotateContext(layer,size:size)
+        let margin = layer.outline?.enabled == true ? max(0,layer.outline!.widthScale*size.width)*2 : 0
+        context.clip(to:box.insetBy(dx:-margin,dy:-margin))
         context.translateBy(x:box.minX,y:box.minY)
         context.scaleBy(x:horizontal,y:factor)
         let height = box.height/factor
         let y = layer.verticallyCentered ? max(0,(height-measured.height)/2) : 0
-        text.draw(with:CGRect(x:0,y:y,width:layoutWidth,height:max(height,measured.height)),
-            options:[.usesLineFragmentOrigin,.usesFontLeading])
+        let area = CGRect(x:0,y:y,width:layoutWidth,height:max(height,measured.height))
+        if let outline = layer.outline, outline.enabled, outline.widthScale > 0 {
+            let stroke = NSMutableAttributedString(attributedString:text)
+            stroke.addAttributes([.strokeColor:NSColor(srgbRed:outline.red,green:outline.green,blue:outline.blue,alpha:1),
+                .strokeWidth:200*outline.widthScale*size.width/max(1,fontStyle(layer,width:size.width).font.pointSize)],range:NSRange(location:0,length:stroke.length))
+            stroke.draw(with:area,options:[.usesLineFragmentOrigin,.usesFontLeading])
+        }
+        text.draw(with:area,options:[.usesLineFragmentOrigin,.usesFontLeading])
+    }
+    static func point(_ point: CGPoint, layer: TextLayer, size: CGSize, inverse: Bool = false) -> CGPoint {
+        let r = rect(layer,size:size), a = (layer.rotation ?? 0) * .pi/180 * (inverse ? -1 : 1)
+        let x = point.x-r.midX, y = point.y-r.midY
+        return CGPoint(x:r.midX+x*cos(a)-y*sin(a),y:r.midY+x*sin(a)+y*cos(a))
+    }
+    static func contains(_ point: CGPoint, layer: TextLayer, size: CGSize) -> Bool {
+        rect(layer,size:size).contains(self.point(point,layer:layer,size:size,inverse:true))
+    }
+    static func rotateContext(_ layer: TextLayer, size: CGSize) {
+        guard let context = NSGraphicsContext.current?.cgContext else { return }
+        let r = rect(layer,size:size)
+        context.translateBy(x:r.midX,y:r.midY)
+        context.rotate(by:(layer.rotation ?? 0) * .pi/180)
+        context.translateBy(x:-r.midX,y:-r.midY)
     }
     static func export(image: URL, layers: [TextLayer], to output: URL) throws {
         guard let source = CGImageSourceCreateWithURL(image as CFURL,nil),
@@ -134,12 +157,16 @@ final class TextCanvasView: NSView {
     var anchorNumbers: [UUID:Int] = [:]
     var select: (UUID) -> Void = { _ in }
     var commit: (UUID, Box) -> Void = { _,_ in }
+    var commitRotation: (UUID, Double) -> Void = { _,_ in }
     private struct Drag {
         var id: UUID
         var origin: CGPoint
         var original: Box
         var box: Box
         var handle: TextHandle?
+        var originalRotation: Double
+        var rotation: Double
+        var rotating: Bool
     }
     private var drag: Drag?
     override var isFlipped: Bool { true }
@@ -148,23 +175,34 @@ final class TextCanvasView: NSView {
 
     private func effective(_ layer: TextLayer) -> TextLayer {
         var value = layer
-        if let drag, drag.id == value.id { value.box = drag.box }
+        if let drag, drag.id == value.id { value.box = drag.box; value.rotation = drag.rotation }
         return value
     }
     private func handle(at point: CGPoint) -> TextHandle? {
-        guard let layer = layers.first(where:{ $0.id == selectedID && $0.visible }) else { return nil }
-        let rect = TextRenderer.rect(effective(layer),size:bounds.size)
+        guard let selected = layers.first(where:{ $0.id == selectedID && $0.visible }) else { return nil }
+        let layer = effective(selected)
+        let rect = TextRenderer.rect(layer,size:bounds.size)
+        let point = TextRenderer.point(point,layer:layer,size:bounds.size,inverse:true)
         return TextHandle.allCases.first { handle in
             let p = handle.point(in:rect)
             return CGRect(x:p.x-8,y:p.y-8,width:16,height:16).contains(point)
         }
     }
+    private func rotationPoint(_ layer: TextLayer) -> CGPoint {
+        let rect = TextRenderer.rect(layer,size:bounds.size)
+        return TextRenderer.point(CGPoint(x:rect.midX,y:rect.minY-26),layer:layer,size:bounds.size)
+    }
+    private func rotationHit(_ point: CGPoint) -> Bool {
+        guard let layer = layers.first(where:{ $0.id == selectedID && $0.visible }) else { return false }
+        let p = rotationPoint(effective(layer))
+        return hypot(point.x-p.x,point.y-p.y) <= 10
+    }
     override func hitTest(_ point: NSPoint) -> NSView? {
         guard editable, !isHidden else { return nil }
         let local = convert(point,from:superview)
         guard bounds.contains(local) else { return nil }
-        if handle(at:local) != nil { return self }
-        return layers.reversed().contains { $0.visible && TextRenderer.rect($0,size:bounds.size).contains(local) } ? self : nil
+        if rotationHit(local) || handle(at:local) != nil { return self }
+        return layers.reversed().contains { $0.visible && TextRenderer.contains(local,layer:$0,size:bounds.size) } ? self : nil
     }
     override func draw(_ dirtyRect: NSRect) {
         for layer in layers where layer.visible {
@@ -172,7 +210,11 @@ final class TextCanvasView: NSView {
         }
         if editable {
             for layer in layers where layer.visible && layer.text.isEmpty && layer.sourceBlockID != nil {
-                let rect = TextRenderer.rect(effective(layer),size:bounds.size)
+                let layer = effective(layer)
+                let rect = TextRenderer.rect(layer,size:bounds.size)
+                NSGraphicsContext.saveGraphicsState()
+                TextRenderer.rotateContext(layer,size:bounds.size)
+                defer { NSGraphicsContext.restoreGraphicsState() }
                 NSColor.systemPurple.withAlphaComponent(0.5).setStroke()
                 let outline = NSBezierPath(rect:rect); outline.lineWidth = 1
                 outline.setLineDash([4,3],count:2,phase:0); outline.stroke()
@@ -183,7 +225,16 @@ final class TextCanvasView: NSView {
             }
         }
         if editable, let selected = layers.first(where:{ $0.id == selectedID && $0.visible }) {
-            let rect = TextRenderer.rect(effective(selected),size:bounds.size)
+            let selected = effective(selected)
+            let rect = TextRenderer.rect(selected,size:bounds.size)
+            NSGraphicsContext.saveGraphicsState()
+            TextRenderer.rotateContext(selected,size:bounds.size)
+            defer { NSGraphicsContext.restoreGraphicsState() }
+            let stem = NSBezierPath()
+            stem.move(to:CGPoint(x:rect.midX,y:rect.minY)); stem.line(to:CGPoint(x:rect.midX,y:rect.minY-26))
+            NSColor.systemPurple.setStroke(); stem.stroke()
+            let knob = NSBezierPath(ovalIn:CGRect(x:rect.midX-5,y:rect.minY-31,width:10,height:10))
+            NSColor.white.setFill(); knob.fill(); knob.stroke()
             NSColor.systemPurple.setStroke()
             let outline = NSBezierPath(rect:rect); outline.lineWidth = 1; outline.stroke()
             for handle in TextHandle.allCases {
@@ -200,8 +251,10 @@ final class TextCanvasView: NSView {
         }
         if let selected = layers.first(where:{ $0.id == selectedID && $0.visible }) {
             let rect = TextRenderer.rect(selected,size:bounds.size)
+            let rp = rotationPoint(selected)
+            addCursorRect(CGRect(x:rp.x-10,y:rp.y-10,width:20,height:20),cursor:.crosshair)
             for handle in TextHandle.allCases {
-                let p = handle.point(in:rect)
+                let p = TextRenderer.point(handle.point(in:rect),layer:selected,size:bounds.size)
                 let cursor: NSCursor = handle == .left || handle == .right ? .resizeLeftRight
                     : handle == .top || handle == .bottom ? .resizeUpDown : .crosshair
                 addCursorRect(CGRect(x:p.x-8,y:p.y-8,width:16,height:16),cursor:cursor)
@@ -211,11 +264,12 @@ final class TextCanvasView: NSView {
     override func mouseDown(with event: NSEvent) {
         guard editable else { return }
         let point = convert(event.locationInWindow,from:nil)
-        let resize = handle(at:point)
-        let selected = resize != nil ? layers.first(where:{ $0.id == selectedID })
-            : layers.reversed().first(where:{ $0.visible && TextRenderer.rect($0,size:bounds.size).contains(point) })
+        let rotating = rotationHit(point)
+        let resize = rotating ? nil : handle(at:point)
+        let selected = rotating || resize != nil ? layers.first(where:{ $0.id == selectedID })
+            : layers.reversed().first(where:{ $0.visible && TextRenderer.contains(point,layer:$0,size:bounds.size) })
         guard let selected else { return }
-        drag = Drag(id:selected.id,origin:point,original:selected.box,box:selected.box,handle:resize)
+        drag = Drag(id:selected.id,origin:point,original:selected.box,box:selected.box,handle:resize,originalRotation:selected.rotation ?? 0,rotation:selected.rotation ?? 0,rotating:rotating)
         selectedID = selected.id; select(selected.id)
         needsDisplay = true
     }
@@ -225,9 +279,28 @@ final class TextCanvasView: NSView {
     private func updateDrag(_ event: NSEvent) {
         guard var value = drag, editable else { return }
         let point = convert(event.locationInWindow,from:nil)
-        let delta = CGSize(width:(point.x-value.origin.x)/max(1,bounds.width),height:(point.y-value.origin.y)/max(1,bounds.height))
-        value.box = TextBoxGeometry.changed(value.original,delta:delta,handle:value.handle,
-            minimum:CGSize(width:12/max(1,bounds.width),height:12/max(1,bounds.height)))
+        let size = bounds.size
+        if value.rotating {
+            let center = CGPoint(x:value.original.cx*size.width,y:value.original.cy*size.height)
+            let delta = atan2(point.y-center.y,point.x-center.x)-atan2(value.origin.y-center.y,value.origin.x-center.x)
+            var angle = value.originalRotation+delta*180 / .pi
+            if event.modifierFlags.contains(.shift) { angle = (angle/15).rounded()*15 }
+            value.rotation = (angle+540).truncatingRemainder(dividingBy:360)-180
+        } else {
+            var dx = point.x-value.origin.x, dy = point.y-value.origin.y
+            let a = value.originalRotation * .pi/180
+            if value.handle != nil { let x = dx*cos(a)+dy*sin(a); dy = -dx*sin(a)+dy*cos(a); dx = x }
+            value.box = TextBoxGeometry.changed(value.original,
+                delta:CGSize(width:dx/max(1,size.width),height:dy/max(1,size.height)),handle:value.handle,
+                minimum:CGSize(width:12/max(1,size.width),height:12/max(1,size.height)))
+            if value.handle != nil {
+                let x = (value.box.cx-value.original.cx)*size.width, y = (value.box.cy-value.original.cy)*size.height
+                value.box.x += (x*cos(a)-y*sin(a)-x)/size.width
+                value.box.y += (x*sin(a)+y*cos(a)-y)/size.height
+                value.box.x = max(0,min(1-value.box.width,value.box.x))
+                value.box.y = max(0,min(1-value.box.height,value.box.y))
+            }
+        }
         drag = value
         if value.handle == nil { NSCursor.closedHand.set() }
         // Only the native view redraws during dragging; no project writes or image reloads.
@@ -237,6 +310,7 @@ final class TextCanvasView: NSView {
         updateDrag(event)
         guard let value = drag else { return }
         drag = nil
+        if value.rotating && value.rotation != value.originalRotation { commitRotation(value.id,value.rotation) }
         if value.box != value.original { commit(value.id,value.box) }
         needsDisplay = true
         window?.invalidateCursorRects(for:self)
@@ -255,8 +329,75 @@ struct TextLayersCanvas: NSViewRepresentable {
         if !view.editable { view.cancelDrag() }
         view.select = { id in if model.selectedTextLayer != id { model.selectedTextLayer = id } }
         view.commit = { id,box in model.updateTextLayer(id) { $0.box = box } }
+        view.commitRotation = { id,angle in model.updateTextLayer(id) { $0.rotation = angle } }
         view.needsDisplay = true
         view.window?.invalidateCursorRects(for:view)
+    }
+}
+
+// The native field editor receives arrow keys while text is being edited.
+struct NumericTextField: NSViewRepresentable {
+    @Binding var value: Double
+    let range: ClosedRange<Double>
+    let label: String
+    func makeCoordinator() -> Coordinator { Coordinator(self) }
+    func makeNSView(context: Context) -> NSTextField {
+        let field = NSTextField(string:"")
+        field.isBezeled = true; field.bezelStyle = .roundedBezel
+        field.delegate = context.coordinator
+        field.setAccessibilityLabel(label)
+        return field
+    }
+    func updateNSView(_ field: NSTextField, context: Context) {
+        context.coordinator.parent = self
+        if field.currentEditor() == nil || context.coordinator.renderedValue != value {
+            field.stringValue = Self.display(value)
+            if let editor = field.currentEditor() as? NSTextView {
+                editor.string = field.stringValue
+                editor.setSelectedRange(NSRange(location:0,length:editor.string.utf16.count))
+            }
+        }
+        context.coordinator.renderedValue = value
+    }
+    static func display(_ value: Double) -> String { String(format:"%.1f",value).replacingOccurrences(of:".0",with:"") }
+    final class Coordinator: NSObject, NSTextFieldDelegate {
+        var parent: NumericTextField
+        var renderedValue: Double?
+        init(_ parent: NumericTextField) { self.parent = parent }
+        func set(_ number: Double, field: NSTextField) {
+            guard number.isFinite else { return }
+            let clamped = max(parent.range.lowerBound,min(parent.range.upperBound,number))
+            if parent.value != clamped { parent.value = clamped }
+            field.stringValue = NumericTextField.display(clamped)
+        }
+        func controlTextDidEndEditing(_ notification: Notification) {
+            guard let field = notification.object as? NSTextField else { return }
+            if let number = Double(field.stringValue.replacingOccurrences(of:",",with:".")) { set(number,field:field) }
+            else { field.stringValue = NumericTextField.display(parent.value) }
+        }
+        func control(_ control: NSControl, textView: NSTextView, doCommandBy command: Selector) -> Bool {
+            guard command == #selector(NSResponder.moveUp(_:)) || command == #selector(NSResponder.moveDown(_:)),
+                  let field = control as? NSTextField else { return false }
+            let current = Double(textView.string.replacingOccurrences(of:",",with:".")) ?? parent.value
+            let flags = NSApp.currentEvent?.modifierFlags ?? []
+            let step = flags.contains(.shift) ? 10.0 : flags.contains(.option) ? 0.1 : 1.0
+            set(current + (command == #selector(NSResponder.moveUp(_:)) ? step : -step),field:field)
+            textView.string = field.stringValue
+            textView.setSelectedRange(NSRange(location:0,length:textView.string.utf16.count))
+            return true
+        }
+    }
+}
+struct LayerNumberField: View {
+    let title: String
+    @Binding var value: Double
+    let range: ClosedRange<Double>
+    var body: some View {
+        HStack {
+            Text(title).frame(width:145,alignment:.leading)
+            NumericTextField(value:$value,range:range,label:title).frame(minWidth:55).frame(height:22)
+            Stepper(title,value:$value,in:range,step:1).labelsHidden().fixedSize()
+        }
     }
 }
 
@@ -327,13 +468,10 @@ struct TextLayerInspector: View {
                             .font(.caption).foregroundStyle(.orange)
                     }
                     number("Размер, px",key: \.fontScale,multiplier:model.workingSize.width,range:1...1000)
-                    HStack {
-                        Text("Ширина букв, %").frame(width:145,alignment:.leading)
-                        TextField("Ширина букв, %",value:Binding(get:{ (model.layer?.widthScale ?? 1)*100 },set:{ value in
-                            guard value.isFinite, let id = model.selectedTextLayer else { return }
-                            model.updateTextLayer(id) { $0.widthScale = max(50,min(200,value))/100 }
-                        }),format:.number.precision(.fractionLength(0...1))).textFieldStyle(.roundedBorder)
-                    }
+                    LayerNumberField(title:"Ширина букв, %",value:Binding(get:{ (model.layer?.widthScale ?? 1)*100 },set:{ value in
+                        guard value.isFinite, let id = model.selectedTextLayer else { return }
+                        model.updateTextLayer(id) { $0.widthScale = max(50,min(200,value))/100 }
+                    }),range:50...200)
                     number("Высота букв, %",key: \.heightScale,multiplier:100,range:50...200)
                     number("Межстрочный, px",key: \.lineSpacing,multiplier:model.workingSize.width,range:0...500)
                     number("Межбуквенный, px",key: \.letterSpacing,multiplier:model.workingSize.width,range:-30...100)
@@ -345,12 +483,32 @@ struct TextLayerInspector: View {
                         guard let rgb = NSColor(color).usingColorSpace(.sRGB) else { return }
                         model.updateTextLayer(layer.id) { $0.red = rgb.redComponent; $0.green = rgb.greenComponent; $0.blue = rgb.blueComponent }
                     }),supportsOpacity:false)
+                    Toggle("Обводка текста",isOn:Binding(get:{ model.layer?.outline?.enabled ?? false },set:{ value in
+                        model.updateTextLayer(layer.id) { if $0.outline == nil { $0.outline = TextOutline() }; $0.outline?.enabled = value }
+                    }))
+                    if layer.outline?.enabled == true {
+                        LayerNumberField(title:"Обводка, px",value:Binding(get:{ (model.layer?.outline?.widthScale ?? 0.002)*model.workingSize.width },set:{ value in
+                            model.updateTextLayer(layer.id) { $0.outline?.widthScale = max(0,min(100,value))/model.workingSize.width }
+                        }),range:0...100)
+                        ColorPicker("Цвет обводки",selection:Binding(get:{
+                            let outline = model.layer?.outline ?? TextOutline()
+                            return Color(.sRGB,red:outline.red,green:outline.green,blue:outline.blue)
+                        },set:{ color in
+                            guard let rgb = NSColor(color).usingColorSpace(.sRGB) else { return }
+                            model.updateTextLayer(layer.id) { $0.outline?.red = rgb.redComponent; $0.outline?.green = rgb.greenComponent; $0.outline?.blue = rgb.blueComponent }
+                        }),supportsOpacity:false)
+                    }
                     Divider()
                     Text("Положение и размер блока").font(.subheadline.bold())
                     number("X, px",key: \.box.x,multiplier:model.workingSize.width,range:0...model.workingSize.width)
                     number("Y, px",key: \.box.y,multiplier:model.workingSize.height,range:0...model.workingSize.height)
                     number("Ширина, px",key: \.box.width,multiplier:model.workingSize.width,range:1...model.workingSize.width)
                     number("Высота, px",key: \.box.height,multiplier:model.workingSize.height,range:1...model.workingSize.height)
+                    LayerNumberField(title:"Поворот, °",value:Binding(get:{ model.layer?.rotation ?? 0 },set:{ value in
+                        model.updateTextLayer(layer.id) { $0.rotation = max(-180,min(180,value)) }
+                    }),range:-180...180)
+                    Text("Круг над рамкой поворачивает текст. Shift — шаг 15°. В числовых полях ↑/↓ меняют значение; Shift — шаг 10, Option — 0,1.")
+                        .font(.caption).foregroundStyle(.secondary)
                     if TextRenderer.textHeight(layer,size:model.workingSize) > layer.box.height*model.workingSize.height+1 {
                         Text("Текст не помещается по высоте. Увеличьте блок или уменьшите шрифт.").font(.caption).foregroundStyle(.orange)
                     }
@@ -366,7 +524,9 @@ struct TextLayerInspector: View {
                         .foregroundStyle(.secondary)
                 }
                 Divider()
-                Button("Экспорт страницы в PNG…",action:model.choosePNGExport).buttonStyle(.borderedProminent)
+                Button("Экспорт страницы в PNG…",action:model.choosePNGExport)
+                Button("Сохранить все страницы…",action:model.chooseAllPNGExport).buttonStyle(.borderedProminent)
+                    .disabled(model.chapter == nil)
                 Text("Слои сохраняются с главой. PNG содержит изображение и видимые слои без рамок редактирования.")
                     .font(.caption).foregroundStyle(.secondary)
             }.padding(14)
@@ -387,17 +547,14 @@ struct TextLayerInspector: View {
         }.toggleStyle(.button).tint(.purple).help(label).accessibilityLabel(label)
     }
     private func number(_ title: String, key: WritableKeyPath<TextLayer,Double>, multiplier: Double, range: ClosedRange<Double>) -> some View {
-        HStack {
-            Text(title).frame(width:145,alignment:.leading)
-            TextField(title,value:Binding(get:{ (model.layer ?? TextLayer())[keyPath:key]*multiplier },set:{ value in
+        LayerNumberField(title:title,value:Binding(get:{ (model.layer ?? TextLayer())[keyPath:key]*multiplier },set:{ value in
                 guard value.isFinite, let id = model.selectedTextLayer else { return }
                 model.updateTextLayer(id) {
                     $0[keyPath:key] = max(range.lowerBound,min(range.upperBound,value))/max(1,multiplier)
                     $0.box.width = min(1,max(0.001,$0.box.width)); $0.box.height = min(1,max(0.001,$0.box.height))
                     $0.box.x = min(1-$0.box.width,max(0,$0.box.x)); $0.box.y = min(1-$0.box.height,max(0,$0.box.y))
                 }
-            }),format:.number.precision(.fractionLength(0...1))).textFieldStyle(.roundedBorder)
-        }
+            }),range:range)
     }
 }
 
@@ -432,12 +589,19 @@ struct TranslationImportPreview: View {
     let plan: TranslationImportPlan
     @State private var policy: TranslationImportPolicy = .keepExisting
     @State private var allowPartial = false
-    private var count: Int { plan.applicable(policy).count }
+    @State private var overrideFont = false
+    @State private var fontName = "Helvetica"
+    @State private var choosingFont = false
+    private var count: Int { plan.applicable(policy,fontName:overrideFont ? fontName : nil).count }
     var body: some View {
         VStack(alignment:.leading,spacing:14) {
             Text("Импорт перевода").font(.title2.bold())
             Text("TXT: \(model.importTXTName)\nКарта: \(model.importMapName)").font(.caption).foregroundStyle(.secondary)
             Text("Реплик в файле: \(plan.items.count). Страниц: \(plan.pageCount). Будет обновлено: \(count).")
+            Toggle("Выбрать общий шрифт для импорта",isOn:$overrideFont)
+            if overrideFont {
+                Button(NSFont(name:fontName,size:14)?.displayName ?? fontName) { choosingFont = true }
+            }
             if plan.conflicts > 0 {
                 Text("Реплик с другим текстом в слоях или переводах OCR: \(plan.conflicts).").foregroundStyle(.orange)
                 Picker("Заполненный текст",selection:$policy) {
@@ -465,7 +629,7 @@ struct TranslationImportPreview: View {
                             HStack {
                                 Text(item.key.label).font(.caption.bold())
                                 Spacer()
-                                if item.unchanged { Text("Уже добавлено").font(.caption).foregroundStyle(.secondary) }
+                                if item.unchanged { Text(overrideFont && (item.fontName != fontName || item.hasFontOverrides) ? "Обновится шрифт" : "Уже добавлено").font(.caption).foregroundStyle(.secondary) }
                                 else if item.conflict && policy == .keepExisting { Text("Сохранится прежний текст").font(.caption).foregroundStyle(.orange) }
                             }
                             if item.conflict { Text("Сейчас: " + item.previous).font(.caption).foregroundStyle(.secondary).lineLimit(4) }
@@ -475,15 +639,18 @@ struct TranslationImportPreview: View {
                     }
                 }
             }.frame(minHeight:160,maxHeight:300)
-            Text("Положение, шрифт и оформление слоёв сохранятся. Перевод также появится у реплик OCR. Весь импорт можно отменить одной правкой.")
+            Text("Положение и оформление слоёв сохранятся. Выбранный шрифт применяется к импортируемым репликам. Перевод также появится у реплик OCR. Весь импорт можно отменить одной правкой.")
                 .font(.caption).foregroundStyle(.secondary)
             HStack {
                 Button("Отмена") { model.pendingTranslationImport = nil }
                 Spacer()
-                Button("Импортировать: \(count)") { model.finishTranslationImport(plan,policy:policy,allowPartial:allowPartial) }
+                Button("Импортировать: \(count)") { model.finishTranslationImport(plan,policy:policy,allowPartial:allowPartial,fontName:overrideFont ? fontName : nil) }
                     .disabled(count == 0 || (!plan.missing.isEmpty && !allowPartial))
                     .buttonStyle(.borderedProminent)
             }
         }.padding(24).frame(width:650)
+        .sheet(isPresented:$choosingFont) {
+            FontChooser(current:fontName) { fontName = $0; choosingFont = false }
+        }
     }
 }

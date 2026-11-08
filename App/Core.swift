@@ -36,9 +36,17 @@ struct TextBlock: Codable, Identifiable, Sendable {
     var warning: String = ""
     var panel: Int = 0
     var translation: TranslationRecord? = nil
+    var ocrLines: [Box]? = nil
 }
 enum TextAlignment: String, Codable, CaseIterable, Sendable {
     case left = "Слева", center = "По центру", right = "Справа"
+}
+struct TextOutline: Codable, Sendable, Equatable {
+    var enabled = true
+    var widthScale = 0.002
+    var red = 0.0
+    var green = 0.0
+    var blue = 0.0
 }
 struct TextLayer: Codable, Identifiable, Sendable, Equatable {
     var id = UUID()
@@ -63,6 +71,8 @@ struct TextLayer: Codable, Identifiable, Sendable, Equatable {
     var strikethrough: Bool? = nil
     var uppercase: Bool? = nil
     var widthScale: Double? = nil
+    var rotation: Double? = nil
+    var outline: TextOutline? = nil
     var sourceBlockID: UUID? = nil
     var anchorEdited: Bool? = nil
 }
@@ -71,6 +81,7 @@ struct ScanPage: Codable, Identifiable, Sendable {
     var file: String
     // Active image relative to the chapter folder; nil uses the original file.
     var imageFile: String? = nil
+    var autoCleanSignature: String? = nil
     var imagePath: String { imageFile ?? file }
     var width: Int = 0
     var height: Int = 0
@@ -351,7 +362,7 @@ enum ReadingOrder {
             if g.contains(where: { $0.confidence < 0.5 }) { issues.append("Низкая уверенность распознавания.") }
             let letters = text.unicodeScalars.filter { CharacterSet.letters.contains($0) }.count
             if letters < 2 || Double(letters) / Double(max(1,text.filter { !$0.isWhitespace }.count)) < 0.55 || text.range(of:"[^\\x00-\\x7F]",options:.regularExpression) != nil { issues.append("Возможна ошибка или звуковой эффект.") }
-            return TextBlock(text:text,original:original,box:box,warning:issues.joined(separator:" "),panel:panelIndex(box,panels:panels))
+            return TextBlock(text:text,original:original,box:box,warning:issues.joined(separator:" "),panel:panelIndex(box,panels:panels),ocrLines:g.map(\.box))
         }
         return sort(blocks)
     }
