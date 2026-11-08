@@ -40,7 +40,7 @@ struct TextBlock: Codable, Identifiable, Sendable {
 enum TextAlignment: String, Codable, CaseIterable, Sendable {
     case left = "Слева", center = "По центру", right = "Справа"
 }
-struct TextLayer: Codable, Identifiable, Sendable {
+struct TextLayer: Codable, Identifiable, Sendable, Equatable {
     var id = UUID()
     var text = "Новый текст"
     var box = Box(x:0.3,y:0.3,width:0.4,height:0.2)
@@ -63,6 +63,8 @@ struct TextLayer: Codable, Identifiable, Sendable {
     var strikethrough: Bool? = nil
     var uppercase: Bool? = nil
     var widthScale: Double? = nil
+    var sourceBlockID: UUID? = nil
+    var anchorEdited: Bool? = nil
 }
 struct ScanPage: Codable, Identifiable, Sendable {
     var id: String { file }
@@ -81,6 +83,69 @@ struct ScanPage: Codable, Identifiable, Sendable {
     var fingerprint: String = ""
     var translationReviewed: Bool? = nil
 }
+enum TranslationAnchors {
+    static func make(for block: TextBlock, page: ScanPage) -> TextLayer {
+        var layer = TextLayer(text:"",box:block.box)
+        layer.sourceBlockID = block.id; layer.anchorEdited = false
+        let lines = max(1,block.original.split(separator:"\n").count)
+        layer.fontScale = max(0.001,min(0.15,block.box.height * Double(max(1,page.height)) / Double(max(1,page.width)) / Double(lines) * 0.72))
+        return layer
+    }
+    @discardableResult static func ensure(in page: inout ScanPage) -> Bool {
+        guard page.scanned else { return false }
+        let before = page.textLayers ?? []
+        var layers = before
+        let blocks = Dictionary(page.blocks.map { ($0.id,$0) },uniquingKeysWith:{ first,_ in first })
+        layers.removeAll { layer in
+            guard let id = layer.sourceBlockID else { return false }
+            return (blocks[id] == nil || blocks[id]?.included == false) && layer.text.isEmpty && layer.anchorEdited != true
+        }
+        for i in layers.indices {
+            guard let id = layers[i].sourceBlockID else { continue }
+            if blocks[id] == nil { layers[i].sourceBlockID = nil }
+            else if let block = blocks[id], block.included, layers[i].text.isEmpty, layers[i].anchorEdited != true {
+                layers[i].box = block.box
+            }
+        }
+        var linked = Set(layers.compactMap(\.sourceBlockID))
+        for block in page.blocks where block.included && !linked.contains(block.id) {
+            layers.append(make(for:block,page:page)); linked.insert(block.id)
+        }
+        guard before != layers else { return false }
+        page.textLayers = layers
+        return true
+    }
+}
+
+struct TextExportMap: Codable {
+    struct Entry: Codable {
+        var page: String
+        var number: Int
+        var blockID: UUID
+        var layerID: UUID
+        var box: Box
+        var source: String
+    }
+    var version = 1
+    var chapter: String
+    var mode: String
+    var entries: [Entry]
+    init(chapter: Chapter, mode: ExportMode) throws {
+        self.chapter = chapter.name
+        self.mode = mode == .original ? "original" : mode == .translated ? "translated" : "bilingual"
+        entries = []
+        for page in chapter.pages where page.scanned {
+            for (i,block) in page.blocks.filter(\.included).enumerated() {
+                guard let layer = page.textLayers?.first(where: { $0.sourceBlockID == block.id }) else {
+                    throw ScanError.missingAnchor
+                }
+                entries.append(Entry(page:page.file,number:i+1,blockID:block.id,layerID:layer.id,box:layer.box,source:block.text))
+            }
+        }
+    }
+    static func url(for transcript: URL) -> URL { transcript.deletingPathExtension().appendingPathExtension("inkflow-map.json") }
+}
+
 struct Chapter: Codable, Sendable {
     var version = 2
     var name: String
@@ -92,9 +157,11 @@ struct Chapter: Codable, Sendable {
 enum ScanError: LocalizedError {
     case unreadable(String)
     case incompatible
+    case missingAnchor
     var errorDescription: String? {
         switch self {
         case .unreadable(let name): return "Не удалось прочитать изображение \(name). Проверьте, открывается ли оно в Просмотре."
+        case .missingAnchor: return "Не удалось подготовить места перевода. Повторите экспорт TXT."
         case .incompatible: return "Этот проект создан другой версией Inkflow. Откройте его в совместимой версии приложения."
         }
     }

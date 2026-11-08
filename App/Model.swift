@@ -23,6 +23,9 @@ final class MangaModel: ObservableObject {
     @Published var exportMode: ExportMode = .original
     @Published var showBrowserTranslation = false
     @Published var browserPart = 0
+    @Published var pendingTranslationImport: TranslationImportPlan? = nil
+    var importTXTName = ""
+    var importMapName = ""
     var browserParts: [String] {
         guard let chapter else { return [] }
         return BrowserTranslation.chunks(ProjectFiles.transcript(chapter, mode: .original))
@@ -48,6 +51,7 @@ final class MangaModel: ObservableObject {
             let loaded = try ProjectFiles.load(url)
             guard !loaded.pages.isEmpty else { message = "В папке нет PNG, JPG или JPEG. Выберите папку со страницами главы."; return }
             chapter = loaded; folder = url; selectedPage = loaded.pages.first?.file
+            pendingTranslationImport = nil
             selectedTextLayer = nil; textEditing = false
             selectedBlock = nil; undoHistory = []; adding = false; healing = false; zoom = 1
             status = "\(loaded.pages.count) стр. · \(loaded.pages.filter(\.scanned).count) распознано · локальная обработка"
@@ -62,7 +66,7 @@ final class MangaModel: ObservableObject {
     func edit(_ action: (inout ScanPage) -> Void) {
         guard !busy, let i = pageIndex, var c = chapter else { return }
         undoHistory.append(c); if undoHistory.count > 80 { undoHistory.removeFirst() }
-        action(&c.pages[i]); c.pages[i].reviewed = false; c.pages[i].translationReviewed = false
+        action(&c.pages[i]); TranslationAnchors.ensure(in:&c.pages[i]); c.pages[i].reviewed = false; c.pages[i].translationReviewed = false
         chapter = c; unsaved = true
         if save() { status = "Правки сохранены в папке главы" }
     }
@@ -81,12 +85,23 @@ final class MangaModel: ObservableObject {
     }
     func updateTextLayer(_ id: UUID, _ action: (inout TextLayer) -> Void) {
         guard let index = page?.textLayers?.firstIndex(where: { $0.id == id }) else { return }
-        editTextLayers { action(&$0[index]) }
+        editTextLayers {
+            action(&$0[index])
+            if $0[index].sourceBlockID != nil { $0[index].anchorEdited = true }
+        }
     }
     func addTextLayer() {
         guard !busy, imageURL != nil else { return }
         var new = TextLayer()
         if let block = page?.blocks.first(where: { $0.id == selectedBlock }) {
+            if let existing = page?.textLayers?.first(where:{ $0.sourceBlockID == block.id }) {
+                if existing.text.isEmpty, let translation = block.translation?.text, !translation.isEmpty {
+                    updateTextLayer(existing.id) { $0.text = translation }
+                }
+                selectedTextLayer = existing.id; textEditing = true; healing = false; adding = false
+                return
+            }
+            new.sourceBlockID = block.id; new.anchorEdited = true
             new.box = block.box
             new.text = block.translation?.text ?? "Новый текст"
         }
@@ -102,6 +117,124 @@ final class MangaModel: ObservableObject {
         guard let id = selectedTextLayer, let layers = page?.textLayers,
               let index = layers.firstIndex(where: { $0.id == id }), layers.indices.contains(index+offset) else { return }
         editTextLayers { $0.swapAt(index,index+offset) }
+    }
+    @discardableResult func prepareTranslationLayers() -> Bool {
+        guard !busy, var updated = chapter else { return false }
+        var changed = false
+        for i in updated.pages.indices {
+            if TranslationAnchors.ensure(in:&updated.pages[i]) { changed = true }
+        }
+        if changed {
+            if let previous = chapter { undoHistory.append(previous); if undoHistory.count > 80 { undoHistory.removeFirst() } }
+            chapter = updated; unsaved = true
+        }
+        return save()
+    }
+    func sourceCaption(for layer: TextLayer) -> String? {
+        guard let id = layer.sourceBlockID, let page,
+              let block = page.blocks.first(where:{ $0.id == id }) else { return nil }
+        if let index = page.blocks.filter(\.included).firstIndex(where:{ $0.id == id }) {
+            return String(format:"[%02d] ",index+1) + block.text
+        }
+        return "Исключена из TXT: " + block.text
+    }
+    func layerTitle(_ layer: TextLayer) -> String {
+        if !layer.text.isEmpty { return layer.text.replacingOccurrences(of:"\n",with:" ") }
+        return sourceCaption(for:layer).map { "Место перевода " + $0 } ?? "Пустой слой"
+    }
+    func exportTXT(to url: URL) throws {
+        guard prepareTranslationLayers(), let chapter, let folder else {
+            throw ScanError.missingAnchor
+        }
+        let mapURL = TextExportMap.url(for:url)
+        let protected = [folder.appendingPathComponent(ProjectFiles.saveName)] + chapter.pages.flatMap {
+            [folder.appendingPathComponent($0.file),folder.appendingPathComponent($0.imagePath)]
+        }
+        let normalized = Set(protected.map { $0.standardizedFileURL.resolvingSymlinksInPath() })
+        guard !normalized.contains(url.standardizedFileURL.resolvingSymlinksInPath()),
+              !normalized.contains(mapURL.standardizedFileURL.resolvingSymlinksInPath()) else {
+            throw UpscaleFailure("Выберите другое имя, чтобы сохранить проект и рабочие изображения.")
+        }
+        let encoder = JSONEncoder(); encoder.outputFormatting = [.prettyPrinted,.sortedKeys]
+        let map = try encoder.encode(TextExportMap(chapter:chapter,mode:exportMode))
+        // Keep the existing TXT format; the sidecar preserves its numbering-to-ID mapping.
+        let text = Data(ProjectFiles.transcript(chapter,mode:exportMode).utf8)
+        let previousMap = FileManager.default.fileExists(atPath:mapURL.path) ? try Data(contentsOf:mapURL) : nil
+        try map.write(to:mapURL,options:.atomic)
+        do { try text.write(to:url,options:.atomic) }
+        catch {
+            if let previousMap { try? previousMap.write(to:mapURL,options:.atomic) }
+            else { try? FileManager.default.removeItem(at:mapURL) }
+            throw error
+        }
+    }
+    func translationImportPlan(txt: URL, map: URL) throws -> TranslationImportPlan {
+        guard !busy, let chapter else { throw TranslationImportError("Откройте главу и дождитесь завершения обработки.") }
+        let document = try TranslationDocument.read(txt)
+        let mapping: TextExportMap
+        do { mapping = try JSONDecoder().decode(TextExportMap.self,from:Data(contentsOf:map)) }
+        catch { throw TranslationImportError("Не удалось прочитать карту экспорта. Выберите исходный файл .inkflow-map.json. \(error.localizedDescription)") }
+        return try TranslationImporter.plan(document:document,map:mapping,chapter:chapter)
+    }
+    func beginTranslationImport() {
+        guard !busy, chapter != nil, save() else { return }
+        let txtPanel = NSOpenPanel(); txtPanel.allowedContentTypes = [.plainText]
+        txtPanel.allowsMultipleSelection = false; txtPanel.prompt = "Выбрать перевод"
+        txtPanel.message = "Выберите переведённый TXT с заголовками страниц и номерами реплик."
+        txtPanel.directoryURL = folder
+        guard txtPanel.runModal() == .OK, let txt = txtPanel.url else { return }
+        do { _ = try TranslationDocument.read(txt) }
+        catch { message = error.localizedDescription; return }
+        let mapPanel = NSOpenPanel(); mapPanel.allowedContentTypes = [.json]
+        mapPanel.allowsMultipleSelection = false; mapPanel.prompt = "Выбрать карту"
+        mapPanel.message = "Выберите .inkflow-map.json от исходного TXT-экспорта. Например, для 155_ru.txt нужна карта исходного 155.txt."
+        mapPanel.directoryURL = txt.deletingLastPathComponent()
+        do {
+            let exact = TextExportMap.url(for:txt)
+            // Reusing the same basename is unambiguous; otherwise ask for the original map.
+            let map: URL
+            if FileManager.default.fileExists(atPath:exact.path) { map = exact }
+            else {
+                guard mapPanel.runModal() == .OK, let chosen = mapPanel.url else { return }
+                map = chosen
+            }
+            do {
+                pendingTranslationImport = try translationImportPlan(txt:txt,map:map)
+                importTXTName = txt.lastPathComponent; importMapName = map.lastPathComponent
+            } catch {
+                // A same-named map may belong to an earlier export; allow choosing another.
+                guard map == exact else { throw error }
+                mapPanel.message = error.localizedDescription + "\nВыберите другую исходную карту экспорта."
+                guard mapPanel.runModal() == .OK, let chosen = mapPanel.url else { return }
+                pendingTranslationImport = try translationImportPlan(txt:txt,map:chosen)
+                importTXTName = txt.lastPathComponent; importMapName = chosen.lastPathComponent
+            }
+        } catch { message = error.localizedDescription }
+    }
+    @discardableResult func commitTranslationImport(_ plan: TranslationImportPlan, policy: TranslationImportPolicy, allowPartial: Bool) throws -> Int {
+        guard !busy, let previous = chapter, let folder, save() else {
+            throw TranslationImportError(message ?? "Не удалось подготовить проект к импорту.")
+        }
+        let (updated,items) = try TranslationImporter.applying(plan,to:previous,policy:policy,allowPartial:allowPartial)
+        guard !items.isEmpty else { return 0 }
+        // Publish and record undo only after the whole updated project is saved successfully.
+        try ProjectFiles.save(updated,to:folder)
+        undoHistory.append(previous); if undoHistory.count > 80 { undoHistory.removeFirst() }
+        chapter = updated; unsaved = false
+        selectedPage = items[0].key.page
+        selectedBlock = nil; healing = false; adding = false; textEditing = true
+        selectedTextLayer = items[0].layerID
+        status = "Импортировано реплик: \(items.count). Проверьте расположение и размер текста."
+        return items.count
+    }
+    func finishTranslationImport(_ plan: TranslationImportPlan, policy: TranslationImportPolicy, allowPartial: Bool) {
+        do {
+            try commitTranslationImport(plan,policy:policy,allowPartial:allowPartial)
+            pendingTranslationImport = nil
+        } catch {
+            pendingTranslationImport = nil
+            message = "Не удалось импортировать перевод. \(error.localizedDescription)"
+        }
     }
     func exportPagePNG(to output: URL) throws {
         guard let input = imageURL, let page else { throw UpscaleFailure("Выберите страницу для экспорта.") }
@@ -308,7 +441,7 @@ final class MangaModel: ObservableObject {
         guard !busy, let c = chapter, let f = folder else { return }
         // Never overwrite existing blocks or manual work through batch recognition.
         let files = c.pages.filter { !$0.scanned && (!onlyCurrent || $0.file == selectedPage) }.map(\.file)
-        guard !files.isEmpty else { status = "Страницы уже распознаны. Можно проверить и отредактировать реплики."; return }
+        guard !files.isEmpty else { guard prepareTranslationLayers() else { return }; status = "Страницы уже распознаны. Места перевода подготовлены во вкладке «Текст на странице»."; return }
         busy = true; stopRequested = false; adding = false
         Task {
             for (n,file) in files.enumerated() {
@@ -319,6 +452,7 @@ final class MangaModel: ObservableObject {
                 do {
                     var result = try await Task.detached(priority:.userInitiated) { try Scanner.scan(url) }.value
                     result.file = file; result.imageFile = sourcePage.imageFile; result.textLayers = sourcePage.textLayers
+                    TranslationAnchors.ensure(in:&result)
                     if let i = chapter?.pages.firstIndex(where: { $0.file == file }) { chapter?.pages[i] = result; unsaved = true }
                 } catch {
                     if let i = chapter?.pages.firstIndex(where: { $0.file == file }) { chapter?.pages[i].error = error.localizedDescription; unsaved = true }
@@ -327,7 +461,7 @@ final class MangaModel: ObservableObject {
             }
             busy = false
             let failed = chapter?.pages.filter { $0.error != nil }.count ?? 0
-            status = stopRequested ? "Обработка остановлена. Результаты сохранены." : "Распознавание завершено. Проверьте порядок и текст.\(failed > 0 ? " Страниц с ошибками: \(failed)." : "")"
+            status = stopRequested ? "Обработка остановлена. Результаты сохранены." : "Распознавание завершено. Места перевода подготовлены. Проверьте порядок и текст.\(failed > 0 ? " Страниц с ошибками: \(failed)." : "")"
         }
     }
     func addRegion(_ box: Box) {
@@ -341,6 +475,7 @@ final class MangaModel: ObservableObject {
             if var c = chapter, let i = c.pages.firstIndex(where: { $0.file == file }) {
                 undoHistory.append(c)
                 c.pages[i].blocks.append(block)
+                TranslationAnchors.ensure(in:&c.pages[i])
                 c.pages[i].translationReviewed = false
                 c.pages[i].reviewed = false
                 chapter = c; unsaved = true
@@ -422,7 +557,7 @@ final class MangaModel: ObservableObject {
         panel.nameFieldStringValue = c.name + (exportMode == .original ? "" : exportMode == .translated ? "_ru_blocks" : "_en-ru") + ".txt"; panel.directoryURL = folder
         panel.prompt = "Сохранить TXT"
         if panel.runModal() == .OK, let url = panel.url {
-            do { try ProjectFiles.transcript(c,mode:exportMode).write(to:url,atomically:true,encoding:.utf8); status = "Сохранено: \(url.lastPathComponent)" }
+            do { try exportTXT(to:url); status = "TXT и карта мест перевода сохранены: \(url.lastPathComponent)" }
             catch { message = "Не удалось сохранить TXT. \(error.localizedDescription)" }
         }
     }

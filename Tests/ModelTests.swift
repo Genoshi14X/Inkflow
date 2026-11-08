@@ -66,11 +66,13 @@ import ImageIO
         let before = reopened.page!.blocks.map(\.text)
         reopened.scanAll()
         precondition(reopened.page!.blocks.map(\.text) == before && !reopened.busy)
+        precondition(reopened.page!.blocks.filter(\.included).allSatisfy { block in reopened.page!.textLayers!.contains { $0.sourceBlockID == block.id } })
         reopened.chapter?.pages[0].translationReviewed = true
         reopened.addRegion(Box(x:0.82,y:0.04,width:0.16,height:0.1))
         while reopened.busy { try await Task.sleep(nanoseconds:20_000_000) }
         precondition(reopened.page!.blocks.count == count+1)
         precondition(reopened.page!.blocks.last!.text.contains("MOM"))
+        precondition(reopened.page!.textLayers!.contains { $0.sourceBlockID == reopened.page!.blocks.last!.id })
         precondition(!reopened.page!.reviewed)
         precondition(reopened.page!.translationReviewed == false)
         reopened.setBrowserTranslation("Сохранить этот черновик")
@@ -79,6 +81,19 @@ import ImageIO
         let saved = try ProjectFiles.load(folder)
         precondition(saved.pages[0].blocks.count == count)
         precondition(saved.browserTranslation == "Сохранить этот черновик")
+        let freshFolder = folder.appendingPathComponent("fresh")
+        try FileManager.default.createDirectory(at:freshFolder,withIntermediateDirectories:true)
+        try FileManager.default.copyItem(at:imageURL,to:freshFolder.appendingPathComponent("01.png"))
+        let fresh = MangaModel(); fresh.open(freshFolder); fresh.scanAll()
+        while fresh.busy { try await Task.sleep(nanoseconds:20_000_000) }
+        precondition(fresh.page!.scanned && !fresh.page!.blocks.isEmpty)
+        precondition(fresh.page!.textLayers!.count == fresh.page!.blocks.filter(\.included).count)
+        for block in fresh.page!.blocks.filter(\.included) {
+            let anchor = fresh.page!.textLayers!.first { $0.sourceBlockID == block.id }!
+            precondition(anchor.box == block.box && anchor.text.isEmpty)
+        }
+        let freshSaved = try ProjectFiles.load(freshFolder)
+        precondition(freshSaved.pages[0].textLayers == fresh.page!.textLayers)
         print("PASS: model edit, reorder, include, merge, delete, undo, review, reopen, rescan preservation, crop OCR, persistence")
     }
 }

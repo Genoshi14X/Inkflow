@@ -34,6 +34,7 @@ struct InkflowApp: App {
             CommandGroup(replacing:.saveItem) {
                 Button("Сохранить правки") { _ = model.save() }.keyboardShortcut("s")
                 Button("Экспорт TXT…",action:model.export).keyboardShortcut("e").disabled(model.chapter == nil || model.busy)
+                Button("Импорт перевода TXT…",action:model.beginTranslationImport).disabled(model.chapter == nil || model.busy)
             }
             CommandGroup(after:.undoRedo) { Button("Отменить правку Inkflow",action:model.undo).keyboardShortcut("z",modifiers:[.command,.shift]).disabled(model.undoHistory.isEmpty || model.busy) }
         }
@@ -89,6 +90,9 @@ struct MainView: View {
         .alert("Не удалось завершить действие",isPresented:Binding(get:{ model.message != nil },set:{ if !$0 { model.message = nil } })) {
             Button("Закрыть",role:.cancel) { model.message = nil }
         } message: { Text(model.message ?? "") }
+        .sheet(item:$model.pendingTranslationImport) { plan in
+            TranslationImportPreview(model:model,plan:plan)
+        }
         .sheet(isPresented:$model.showBrowserTranslation) {
             VStack(alignment:.leading,spacing:14) {
                 Text("Перевод главы в Яндексе").font(.title2.bold())
@@ -116,7 +120,7 @@ struct MainView: View {
                 }
             }.padding(24).frame(width:650)
         }
-        .onChange(of:model.selectedPage) { _ in model.selectedBlock = nil; model.adding = false; model.healing = false; model.selectedTextLayer = nil }
+        .onChange(of:model.selectedPage) { _ in model.selectedBlock = nil; model.adding = false; model.healing = false; if model.layer == nil { model.selectedTextLayer = nil } }
     }
     var sidebar: some View {
         VStack(alignment:.leading,spacing:0) {
