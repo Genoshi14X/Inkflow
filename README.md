@@ -18,6 +18,12 @@ Inkflow помогает подготовить перевод манги: ув�
 | Экспорт | TXT главы, PNG отдельной страницы или всей главы с текстом в полном разрешении |
 | Сохранение | Автоматическое сохранение проекта рядом со сканами, восстановление рабочих изображений и слоёв |
 
+## Скачать
+
+Готовая сборка для Mac с Apple Silicon находится в [GitHub Releases](https://github.com/Genoshi14X/inkflow/releases/latest). Скачайте ZIP, распакуйте и перенесите **Inkflow.app** в Applications. Python и модели nunif устанавливаются отдельно для апскейла и восстановления фона.
+
+Сборка пока имеет ad-hoc подпись без Developer ID и нотариализации Apple; macOS может заблокировать первый запуск скачанного приложения. Подробности и ограничения указаны в описании релиза.
+
 ## Запуск и требования
 
 После [сборки из исходников](#разработка) откройте **`dist/Inkflow.app`** двойным щелчком. Приложение предназначено для Apple Silicon и macOS 13+. Проверено на M1 Pro с macOS 26.5.2; более старые версии macOS отдельно не проверялись.
@@ -343,3 +349,33 @@ INKFLOW_PRIVATE_SAMPLES=1 ./scripts/test.sh
 Публичный репозиторий: [Genoshi14X/Inkflow](https://github.com/Genoshi14X/Inkflow). В Git входят исходники, иконка и скрипты. Папки `samples/`, `output/`, `dist/`, `bin/`, сохранённые проекты и локальные настройки исключены из Git.
 
 `Sources/ocr.swift` и локальный `scripts/report.py` сохранены от первого эксперимента. `output/review.html`, `output/verified.txt` и `output/reference.json` содержат ручную проверку этого эксперимента. `samples/01.png`–`05.png` — копии вложений в порядке отправки, а не номера страниц главы. Эти локальные материалы не входят в публичный репозиторий.
+
+## Выпуск новой версии из PhpStorm
+
+Откройте **View → Tool Windows → Terminal** в корне проекта. Терминал PhpStorm выполняет те же команды, что и обычный терминал macOS ([документация JetBrains](https://www.jetbrains.com/help/phpstorm/terminal-emulator.html)).
+
+1. Обновите номер в `VERSION` и подготовьте описание `releases/v<версия>.md`.
+2. Выполните `./scripts/test.sh`. Для полной проверки очистки и кисти задайте `INKFLOW_HEALING_PYTHON` — путь к Python с OpenCV и Pillow.
+3. Выполните `./scripts/release.sh`. Он соберёт приложение, проверит подпись, содержимое и распаковку ZIP, затем создаст архив и SHA-256 в `dist/`. Этот скрипт ничего не публикует.
+4. Через окно **Commit** добавьте исходники, новые файлы, `VERSION`, скрипты и описание релиза. Проверьте изменения, выполните Commit и Push. Папки `dist/`, `bin/`, `output/`, сканы и модели в коммит не добавляются.
+5. Создайте тег на этом коммите и отправьте его в GitHub. Для версии 1.0.0:
+
+```sh
+git tag -a v1.0.0 -m "Inkflow 1.0.0"
+git push origin v1.0.0
+```
+
+6. В [GitHub Releases](https://github.com/Genoshi14X/inkflow/releases) выберите **Draft a new release**, существующий тег `v1.0.0`, заголовок **Inkflow 1.0.0**, вставьте описание из `releases/v1.0.0.md` и прикрепите ZIP и файл `.sha256` из `dist/`. Нажмите **Publish release** ([документация GitHub](https://docs.github.com/en/repositories/releasing-projects-on-github/managing-releases-in-a-repository)).
+
+Вместо шага 6 можно использовать GitHub CLI из того же терминала:
+
+```sh
+gh auth login --hostname github.com --web
+gh release create v1.0.0 \
+  dist/Inkflow-1.0.0-macos-arm64.zip \
+  dist/Inkflow-1.0.0-macos-arm64.zip.sha256 \
+  --verify-tag --title "Inkflow 1.0.0" \
+  --notes-file releases/v1.0.0.md
+```
+
+Вход нужен только если GitHub CLI ещё не авторизован. `--verify-tag` требует заранее отправленный тег и предотвращает случайный выпуск с другого коммита. Для следующих версий замените номер во всех командах. Уже опубликованные теги не перемещайте.
