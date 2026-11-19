@@ -9,7 +9,7 @@ xcrun swiftc -O -swift-version 5 App/Core.swift App/Upscale.swift App/Healing.sw
 if [[ "${INKFLOW_PRIVATE_SAMPLES:-0}" == "1" ]]; then
     python3 scripts/evaluate.py
 fi
-xcrun swiftc -O App/Core.swift Tests/BrowserTranslationTests.swift -o bin/browser-translation-tests
+xcrun swiftc -O App/Core.swift App/TranslationImport.swift Tests/BrowserTranslationTests.swift -o bin/browser-translation-tests
 ./bin/browser-translation-tests
 xcrun swiftc -O -swift-version 5 App/Core.swift App/Upscale.swift App/Healing.swift App/Cleaning.swift App/TextLayers.swift App/TranslationImport.swift App/PageExport.swift App/Model.swift Tests/UpscaleTests.swift -o bin/upscale-tests
 ./bin/upscale-tests

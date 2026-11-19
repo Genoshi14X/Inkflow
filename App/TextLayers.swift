@@ -4,6 +4,12 @@ import ImageIO
 
 // Shared AppKit typography for the on-screen layer and full-resolution PNG export.
 enum TextRenderer {
+    private static let drawingOptions: NSString.DrawingOptions = [.usesLineFragmentOrigin,.usesFontLeading]
+    private static let russianLetters = CharacterSet(charactersIn:"АБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯабвгдеёжзийклмнопрстуфхцчшщъыьэюя")
+    static func supportsRussian(_ name: String) -> Bool {
+        NSFont(name:name,size:12)?.coveredCharacterSet.isSuperset(of:russianLetters) == true
+    }
+
     static func rect(_ layer: TextLayer, size: CGSize) -> CGRect {
         CGRect(x:layer.box.x*size.width,y:layer.box.y*size.height,
                width:layer.box.width*size.width,height:layer.box.height*size.height)
@@ -50,9 +56,39 @@ enum TextRenderer {
         if layer.strikethrough == true { attributes[.strikethroughStyle] = NSUnderlineStyle.single.rawValue }
         return NSAttributedString(string:layer.uppercase == true ? layer.text.uppercased() : layer.text,attributes:attributes)
     }
+    private static func layoutBounds(_ text: NSAttributedString, width: Double) -> CGRect {
+        text.boundingRect(with:CGSize(width:width,height:CGFloat.greatestFiniteMagnitude),options:drawingOptions)
+    }
     static func textHeight(_ layer: TextLayer, size: CGSize) -> Double {
-        attributed(layer,width:size.width).boundingRect(with:CGSize(width:max(1,layer.box.width*size.width/horizontalScale(layer)),height:CGFloat.greatestFiniteMagnitude),
-            options:[.usesLineFragmentOrigin,.usesFontLeading]).height * layer.heightScale
+        let width = max(1,rect(layer,size:size).width/horizontalScale(layer))
+        return layoutBounds(attributed(layer,width:size.width),width:width).height * max(0.1,layer.heightScale)
+    }
+    static func fits(_ layer: TextLayer, size: CGSize) -> Bool {
+        if layer.text.isEmpty { return true }
+        let box = rect(layer,size:size), horizontal = horizontalScale(layer)
+        let width = box.width/horizontal
+        let outline = layer.outline.map { $0.enabled ? max(0,$0.widthScale*size.width) : 0 } ?? 0
+        guard width >= 1, box.height > 0 else { return false }
+        let bounds = layoutBounds(attributed(layer,width:size.width),width:width)
+        return bounds.width*horizontal + 2*outline <= box.width + 0.01
+            && bounds.height*max(0.1,layer.heightScale) + 2*outline <= box.height + 0.01
+    }
+    static func fitTranslation(_ layer: inout TextLayer, size: CGSize) -> Bool {
+        let minimum = 12/size.width
+        var low = minimum, high = max(minimum,layer.fontScale)
+        layer.fontScale = high
+        if fits(layer,size:size) { return true }
+        layer.fontScale = minimum
+        guard fits(layer,size:size) else { return false }
+        // Find the largest fitting size to within a fraction of a working-image pixel.
+        for _ in 0..<16 {
+            if (high-low)*size.width <= 0.1 { break }
+            let candidate = (low+high)/2
+            layer.fontScale = candidate
+            if fits(layer,size:size) { low = candidate } else { high = candidate }
+        }
+        layer.fontScale = low
+        return true
     }
     static func draw(_ layer: TextLayer, size: CGSize) {
         guard layer.visible, let context = NSGraphicsContext.current?.cgContext else { return }
@@ -61,8 +97,7 @@ enum TextRenderer {
         let horizontal = horizontalScale(layer)
         let layoutWidth = max(1,box.width/horizontal)
         let text = attributed(layer,width:size.width)
-        let measured = text.boundingRect(with:CGSize(width:layoutWidth,height:CGFloat.greatestFiniteMagnitude),
-            options:[.usesLineFragmentOrigin,.usesFontLeading])
+        let measured = layoutBounds(text,width:layoutWidth)
         context.saveGState(); defer { context.restoreGState() }
         rotateContext(layer,size:size)
         let margin = layer.outline?.enabled == true ? max(0,layer.outline!.widthScale*size.width)*2 : 0
@@ -76,9 +111,9 @@ enum TextRenderer {
             let stroke = NSMutableAttributedString(attributedString:text)
             stroke.addAttributes([.strokeColor:NSColor(srgbRed:outline.red,green:outline.green,blue:outline.blue,alpha:1),
                 .strokeWidth:200*outline.widthScale*size.width/max(1,fontStyle(layer,width:size.width).font.pointSize)],range:NSRange(location:0,length:stroke.length))
-            stroke.draw(with:area,options:[.usesLineFragmentOrigin,.usesFontLeading])
+            stroke.draw(with:area,options:drawingOptions)
         }
-        text.draw(with:area,options:[.usesLineFragmentOrigin,.usesFontLeading])
+        text.draw(with:area,options:drawingOptions)
     }
     static func point(_ point: CGPoint, layer: TextLayer, size: CGSize, inverse: Bool = false) -> CGPoint {
         let r = rect(layer,size:size), a = (layer.rotation ?? 0) * .pi/180 * (inverse ? -1 : 1)
@@ -509,8 +544,8 @@ struct TextLayerInspector: View {
                     }),range:-180...180)
                     Text("Круг над рамкой поворачивает текст. Shift — шаг 15°. В числовых полях ↑/↓ меняют значение; Shift — шаг 10, Option — 0,1.")
                         .font(.caption).foregroundStyle(.secondary)
-                    if TextRenderer.textHeight(layer,size:model.workingSize) > layer.box.height*model.workingSize.height+1 {
-                        Text("Текст не помещается по высоте. Увеличьте блок или уменьшите шрифт.").font(.caption).foregroundStyle(.orange)
+                    if !TextRenderer.fits(layer,size:model.workingSize) {
+                        Text("Текст выходит за рамку. Сократите реплику, увеличьте рамку или уменьшите шрифт.").font(.caption).foregroundStyle(.orange)
                     }
                     Toggle("Показывать слой",isOn:Binding(get:{ model.layer?.visible ?? true },set:{ value in model.updateTextLayer(layer.id) { $0.visible = value } }))
                     HStack {
@@ -560,6 +595,7 @@ struct TextLayerInspector: View {
 
 private struct FontChooser: View {
     let current: String
+    var russianOnly = false
     let choose: (String) -> Void
     @Environment(\.dismiss) private var dismiss
     @State private var query = ""
@@ -579,7 +615,11 @@ private struct FontChooser: View {
             }
             Button("Закрыть") { dismiss() }
         }.padding(20).frame(width:460,height:480)
-        .onAppear { fonts = NSFontManager.shared.availableFonts.sorted { $0.localizedStandardCompare($1) == .orderedAscending } }
+        .onAppear {
+            fonts = NSFontManager.shared.availableFonts
+                .filter { !russianOnly || TextRenderer.supportsRussian($0) }
+                .sorted { $0.localizedStandardCompare($1) == .orderedAscending }
+        }
     }
 }
 
@@ -587,25 +627,41 @@ private struct FontChooser: View {
 struct TranslationImportPreview: View {
     @ObservedObject var model: MangaModel
     let plan: TranslationImportPlan
+    var isBrowser = false
     @State private var policy: TranslationImportPolicy = .keepExisting
     @State private var allowPartial = false
     @State private var overrideFont = false
     @State private var fontName = "Helvetica"
     @State private var choosingFont = false
-    private var count: Int { plan.applicable(policy,fontName:overrideFont ? fontName : nil).count }
+    @State private var overflow: Set<UUID> = []
+    @State private var problem: String?
+    @State private var fitValid = false
+    private var selectedFont: String? { isBrowser || overrideFont ? fontName : nil }
+    private var count: Int { plan.applicable(policy,fontName:selectedFont).count }
     var body: some View {
         VStack(alignment:.leading,spacing:14) {
-            Text("Импорт перевода").font(.title2.bold())
-            Text("TXT: \(model.importTXTName)\nКарта: \(model.importMapName)").font(.caption).foregroundStyle(.secondary)
-            Text("Реплик в файле: \(plan.items.count). Страниц: \(plan.pageCount). Будет обновлено: \(count).")
-            Toggle("Выбрать общий шрифт для импорта",isOn:$overrideFont)
-            if overrideFont {
+            Text(isBrowser ? "Проверка раскладки" : "Импорт перевода").font(.title2.bold())
+            if !isBrowser {
+                Text("TXT: \(model.importTXTName)\nКарта: \(model.importMapName)").font(.caption).foregroundStyle(.secondary)
+            }
+            Text("Реплик в переводе: \(plan.items.count). Страниц: \(plan.pageCount). Будет обновлено: \(count).")
+            if isBrowser {
+                HStack {
+                    Text("Шрифт для главы")
+                    Button(NSFont(name:fontName,size:14)?.displayName ?? fontName) { choosingFont = true }
+                }
+            } else {
+                Toggle("Выбрать общий шрифт для импорта",isOn:$overrideFont)
+            }
+            if !isBrowser, overrideFont {
                 Button(NSFont(name:fontName,size:14)?.displayName ?? fontName) { choosingFont = true }
             }
             if plan.conflicts > 0 {
                 Text("Реплик с другим текстом в слоях или переводах OCR: \(plan.conflicts).").foregroundStyle(.orange)
-                Picker("Заполненный текст",selection:$policy) {
-                    ForEach(TranslationImportPolicy.allCases,id:\.self) { Text($0.rawValue).tag($0) }
+                Picker("Заполненный текст",selection:Binding(get:{ policy },set:{ policy = $0; refreshFit() })) {
+                    ForEach(TranslationImportPolicy.allCases,id:\.self) { option in
+                        Text(isBrowser && option == .replaceExisting ? "Заменить текст новым переводом" : option.rawValue).tag(option)
+                    }
                 }
             }
             if !plan.missing.isEmpty {
@@ -615,13 +671,18 @@ struct TranslationImportPreview: View {
                 Toggle("Импортировать неполный перевод",isOn:$allowPartial)
             }
             if plan.items.contains(where: \.sourceChanged) {
-                Text("После экспорта часть исходных реплик была исправлена. Сверьте их перевод; привязка сохраняется по ID.")
+                Text("Исходный текст части реплик изменился. Сверьте их перевод перед добавлением.")
                     .font(.caption).foregroundStyle(.orange)
             }
             if plan.items.contains(where: \.hidden) {
                 Text("Некоторые слои скрыты. Их видимость сохранится; включите её в панели слоя, чтобы увидеть перевод.")
                     .font(.caption).foregroundStyle(.secondary)
             }
+            if !overflow.isEmpty {
+                Text("Не поместилось реплик: \(overflow.count). Сократите их в браузерном результате или увеличьте рамки после добавления.")
+                    .font(.caption).foregroundStyle(.orange)
+            }
+            if let problem { Text(problem).foregroundStyle(.orange) }
             ScrollView {
                 LazyVStack(alignment:.leading,spacing:12) {
                     ForEach(plan.items) { item in
@@ -629,7 +690,8 @@ struct TranslationImportPreview: View {
                             HStack {
                                 Text(item.key.label).font(.caption.bold())
                                 Spacer()
-                                if item.unchanged { Text(overrideFont && (item.fontName != fontName || item.hasFontOverrides) ? "Обновится шрифт" : "Уже добавлено").font(.caption).foregroundStyle(.secondary) }
+                                if overflow.contains(item.blockID) { Text("Текст выходит за рамку").font(.caption).foregroundStyle(.orange) }
+                                else if item.unchanged { Text(selectedFont != nil && (item.fontName != fontName || item.hasFontOverrides) ? "Обновится шрифт" : "Уже добавлено").font(.caption).foregroundStyle(.secondary) }
                                 else if item.conflict && policy == .keepExisting { Text("Сохранится прежний текст").font(.caption).foregroundStyle(.orange) }
                             }
                             if item.conflict { Text("Сейчас: " + item.previous).font(.caption).foregroundStyle(.secondary).lineLimit(4) }
@@ -639,18 +701,55 @@ struct TranslationImportPreview: View {
                     }
                 }
             }.frame(minHeight:160,maxHeight:300)
-            Text("Положение и оформление слоёв сохранятся. Выбранный шрифт применяется к импортируемым репликам. Перевод также появится у реплик OCR. Весь импорт можно отменить одной правкой.")
-                .font(.caption).foregroundStyle(.secondary)
+            if !isBrowser {
+                Text("Положение и оформление слоёв сохранятся. Выбранный шрифт применяется к импортируемым репликам. Перевод также появится у реплик OCR. Весь импорт можно отменить одной правкой.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
             HStack {
-                Button("Отмена") { model.pendingTranslationImport = nil }
+                Button(isBrowser ? "Назад" : "Отмена") {
+                    if isBrowser { model.browserTranslationPreview = nil }
+                    else { model.pendingTranslationImport = nil }
+                }
                 Spacer()
-                Button("Импортировать: \(count)") { model.finishTranslationImport(plan,policy:policy,allowPartial:allowPartial,fontName:overrideFont ? fontName : nil) }
-                    .disabled(count == 0 || (!plan.missing.isEmpty && !allowPartial))
+                Button(isBrowser ? "Добавить в слои (\(count))" : "Импортировать: \(count)",action:apply)
+                    .disabled(count == 0 || (isBrowser && !fitValid) || (!plan.missing.isEmpty && !allowPartial))
                     .buttonStyle(.borderedProminent)
             }
         }.padding(24).frame(width:650)
         .sheet(isPresented:$choosingFont) {
-            FontChooser(current:fontName) { fontName = $0; choosingFont = false }
+            FontChooser(current:fontName,russianOnly:isBrowser) { name in
+                fontName = name
+                choosingFont = false
+                refreshFit()
+            }
+        }
+        .onAppear {
+            if isBrowser, let saved = model.chapter?.browserTranslationFont, TextRenderer.supportsRussian(saved) { fontName = saved }
+            refreshFit()
+        }
+    }
+
+    private func refreshFit() {
+        guard isBrowser else { return }
+        do {
+            overflow = try model.browserTranslationOverflow(plan,policy:policy,fontName:fontName)
+            problem = nil
+            fitValid = true
+        } catch {
+            overflow = []
+            problem = error.localizedDescription
+            fitValid = false
+        }
+    }
+
+    private func apply() {
+        if isBrowser {
+            do {
+                try model.commitTranslationImport(plan,policy:policy,allowPartial:false,fontName:fontName,fitBrowserText:true)
+                model.closeBrowserTranslation()
+            } catch { problem = error.localizedDescription }
+        } else {
+            model.finishTranslationImport(plan,policy:policy,allowPartial:allowPartial,fontName:selectedFont)
         }
     }
 }

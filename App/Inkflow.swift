@@ -35,6 +35,7 @@ struct InkflowApp: App {
                 Button("Сохранить правки") { _ = model.save() }.keyboardShortcut("s")
                 Button("Экспорт TXT…",action:model.export).keyboardShortcut("e").disabled(model.chapter == nil || model.busy)
                 Button("Импорт перевода TXT…",action:model.beginTranslationImport).disabled(model.chapter == nil || model.busy)
+                Button("Очистить распознанный текст",action:model.startTextCleaning).disabled(model.chapter == nil || model.busy)
                 Button("Сохранить все страницы в PNG…",action:model.chooseAllPNGExport).disabled(model.chapter == nil || model.busy)
             }
             CommandGroup(after:.undoRedo) { Button("Отменить правку Inkflow",action:model.undo).keyboardShortcut("z",modifiers:[.command,.shift]).disabled(model.undoHistory.isEmpty || model.busy) }
@@ -44,6 +45,7 @@ struct InkflowApp: App {
 
 struct MainView: View {
     @ObservedObject var model: MangaModel
+    @State private var showCleaningReport = false
     var body: some View {
         VStack(spacing:0) {
             HStack(spacing:14) {
@@ -56,14 +58,22 @@ struct MainView: View {
                 Spacer()
                 Button("Открыть папку…",action:model.chooseFolder).disabled(model.busy)
                 if model.busy { Button("Остановить",action:model.stop) }
-                else { Button("Распознать главу") { model.scanAll() }.disabled(model.chapter == nil).buttonStyle(.borderedProminent) }
+                else { Button("Распознать все страницы",action:model.scanAll).disabled(model.chapter == nil).buttonStyle(.borderedProminent) }
                 Button("Яндекс Переводчик…", action:model.beginBrowserTranslation)
                     .disabled(model.chapter == nil || model.busy)
                 Picker("TXT",selection:$model.exportMode) {
                     ForEach(ExportMode.allCases) { mode in Text(mode.rawValue).tag(mode) }
                 }.frame(width:145).disabled(model.busy)
                 VStack(alignment:.leading,spacing:5) {
-                    Button("Экспорт TXT…",action:model.export).disabled(model.chapter == nil || model.busy)
+                    HStack(spacing:6) {
+                        Button("Экспорт TXT…",action:model.export)
+                        Menu {
+                            Button("Очистить распознанный текст",action:model.startTextCleaning)
+                        } label: {
+                            Label("Действия с текстом",systemImage:"ellipsis.circle")
+                                .labelStyle(.iconOnly)
+                        }.fixedSize()
+                    }.disabled(model.chapter == nil || model.busy)
                     Toggle("Очистить текст после экспорта",isOn:$model.autoCleanAfterExport)
                         .font(.caption).disabled(model.busy)
                         .help("Удалить найденные буквы с рабочих изображений после сохранения TXT. Исходники сохранятся; очистку можно отменить.")
@@ -90,6 +100,19 @@ struct MainView: View {
                 if model.busy { ProgressView().controlSize(.small) }
                 Text(model.status).font(.caption).lineLimit(2)
                 Spacer()
+                if !model.cleaningSkippedPages.isEmpty {
+                    Button("Страницы с пропусками") { showCleaningReport = true }
+                        .popover(isPresented:$showCleaningReport) {
+                            VStack(alignment:.leading,spacing:8) {
+                                Text("Проверьте эти страницы и при необходимости очистите надписи кистью.")
+                                ScrollView {
+                                    VStack(alignment:.leading,spacing:4) {
+                                        ForEach(model.cleaningSkippedPages,id:\.self) { Text($0) }
+                                    }.frame(maxWidth:.infinity,alignment:.leading)
+                                }.frame(height:120)
+                            }.frame(width:290).padding(16)
+                        }
+                }
                 if let c = model.chapter { Text("Проверено: \(c.pages.filter(\.reviewed).count) / \(c.pages.count)").font(.caption).foregroundStyle(.secondary) }
             }.padding(10)
         }
@@ -99,32 +122,8 @@ struct MainView: View {
         .sheet(item:$model.pendingTranslationImport) { plan in
             TranslationImportPreview(model:model,plan:plan)
         }
-        .sheet(isPresented:$model.showBrowserTranslation) {
-            VStack(alignment:.leading,spacing:14) {
-                Text("Перевод главы в Яндексе").font(.title2.bold())
-                Text("1. Скопируйте оригинал и вставьте его в левое поле браузера: ⌘V. Яндекс переведёт текст онлайн с английского на русский.").foregroundStyle(.secondary)
-                HStack {
-                    Picker("Часть", selection:$model.browserPart) {
-                        ForEach(Array(model.browserParts.indices), id: \.self) { i in
-                            Text("\(i + 1) из \(model.browserParts.count)").tag(i)
-                        }
-                    }.frame(width:170)
-                    Button("Скопировать EN и открыть Яндекс", action:model.copyAndOpenYandex)
-                }
-                Text("Для длинной главы переводите части по очереди. Перед вставкой новой части очистите левое поле Яндекса.").font(.caption).foregroundStyle(.secondary)
-                Text("2. Скопируйте русский результат в браузере и добавьте его сюда. Здесь можно исправить текст перед сохранением.")
-                Button("Добавить перевод из буфера", action:model.appendBrowserTranslation)
-                TextEditor(text:Binding(get:{ model.chapter?.browserTranslation ?? "" },set:{ model.setBrowserTranslation($0) }))
-                    .font(.body).frame(height:260).border(Color.secondary.opacity(0.3))
-                Text("Черновик сохраняется с главой. После правок оригинала обновите перевод вручную; к отдельным облачкам он не привязан.").font(.caption).foregroundStyle(.secondary)
-                HStack {
-                    Button("Закрыть") { model.showBrowserTranslation = false }
-                    Spacer()
-                    Button("Сохранить RU TXT…", action:model.exportBrowserTranslation)
-                        .disabled((model.chapter?.browserTranslation ?? "").trimmingCharacters(in:.whitespacesAndNewlines).isEmpty)
-                        .buttonStyle(.borderedProminent)
-                }
-            }.padding(24).frame(width:650)
+        .sheet(isPresented:$model.showBrowserTranslation,onDismiss:model.closeBrowserTranslation) {
+            BrowserTranslationView(model:model)
         }
         .onChange(of:model.selectedPage) { _ in model.selectedBlock = nil; model.adding = false; model.healing = false; if model.layer == nil { model.selectedTextLayer = nil } }
     }
@@ -169,9 +168,6 @@ struct MainView: View {
                 .font(.caption).foregroundStyle(.secondary).padding(.horizontal,14)
             if let p = model.page {
                 if let error = p.error { Text(error).font(.caption).foregroundStyle(.orange).padding(.horizontal,14) }
-                if !p.scanned {
-                    Button("Распознать страницу") { model.scanAll(onlyCurrent:true) }.padding(14).disabled(model.busy)
-                }
                 ScrollViewReader { proxy in
                     ScrollView {
                         LazyVStack(spacing:10) {
@@ -194,6 +190,105 @@ struct MainView: View {
                 Spacer().frame(height:4)
             } else { Spacer() }
         }.background(Color(nsColor:.controlBackgroundColor))
+    }
+}
+
+private struct BrowserTranslationView: View {
+    @ObservedObject var model: MangaModel
+    @State private var part = 0
+    @State private var pasted: [Int: String] = [:]
+    @State private var problem: String?
+
+    var body: some View {
+        if let plan = model.browserTranslationPreview {
+            TranslationImportPreview(model:model,plan:plan,isBrowser:true)
+        } else {
+            VStack(alignment:.leading,spacing:12) {
+                Text("Перевод главы в Яндексе").font(.title2.bold())
+                if let session = model.browserTranslation {
+                    exchange(session,part:part)
+                } else if let message = model.browserTranslationProblem {
+                    Text(message).foregroundStyle(.secondary)
+                }
+                DisclosureGroup("Свободный черновик") {
+                    VStack(alignment:.leading,spacing:8) {
+                        TextEditor(text:Binding(get:{ model.chapter?.browserTranslation ?? "" },set:model.setBrowserTranslation))
+                            .frame(height:105).border(.secondary.opacity(0.3))
+                            .accessibilityLabel("Свободный черновик перевода")
+                        HStack {
+                            Button("Добавить из буфера",action:model.appendBrowserTranslation)
+                            Button("Сохранить RU TXT…",action:model.exportBrowserTranslation)
+                                .disabled((model.chapter?.browserTranslation ?? "").trimmingCharacters(in:.whitespacesAndNewlines).isEmpty)
+                        }
+                    }.padding(.top,8)
+                }
+                HStack {
+                    Button("Закрыть",action:model.closeBrowserTranslation)
+                    Spacer()
+                    if let session = model.browserTranslation {
+                        Button("Проверить раскладку") { perform { try model.reviewBrowserTranslation() } }
+                            .disabled(session.completedParts != session.parts.count)
+                            .buttonStyle(.borderedProminent)
+                    }
+                }
+            }.padding(24).frame(width:650)
+        }
+    }
+
+    private func exchange(_ session: BrowserTranslation, part: Int) -> some View {
+        VStack(alignment:.leading,spacing:10) {
+            Text("Вставьте оригинал в левое поле Яндекса. Скопируйте результат из правого поля вместе с метками.")
+                .foregroundStyle(.secondary)
+            HStack {
+                Picker("Часть",selection:$part) {
+                    ForEach(session.parts.indices,id:\.self) { index in
+                        Text("\(index + 1) из \(session.parts.count)" + (session.hasResult(for:index) ? " · готово" : "")).tag(index)
+                    }
+                }.fixedSize()
+                Button("Скопировать оригинал и открыть Яндекс") { perform { try model.copyAndOpenYandex(part:part) } }
+            }
+            if session.parts.count > 1 {
+                Text("Загружено частей: \(session.completedParts) из \(session.parts.count). Перед вставкой следующей части замените весь текст в левом поле.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            HStack {
+                Button("Вставить перевод из буфера") {
+                    perform {
+                        let text = try model.browserResultFromPasteboard()
+                        pasted[part] = text
+                        model.clearBrowserResult(for:part)
+                        try model.acceptBrowserResult(text,for:part)
+                    }
+                }
+                if session.hasResult(for:part) {
+                    Label("Часть проверена",systemImage:"checkmark.circle").foregroundStyle(.secondary)
+                }
+            }
+            if let problem { Text(problem).foregroundStyle(.orange).fixedSize(horizontal:false,vertical:true) }
+            if let text = pasted[part] {
+                TextEditor(text:Binding(get:{ pasted[part] ?? "" },set:{ value in
+                    pasted[part] = value
+                    model.clearBrowserResult(for:part)
+                    problem = nil
+                })).frame(height:125).border(.secondary.opacity(0.3)).id(part)
+                    .accessibilityLabel("Перевод с метками")
+                Button("Проверить часть") { perform { try model.acceptBrowserResult(text,for:part) } }
+                    .disabled(session.hasResult(for:part))
+            }
+            if session.parts.indices.contains(part), pasted[part] != nil {
+                DisclosureGroup("Оригинал с метками") {
+                    ScrollView {
+                        Text(session.parts[part].source).textSelection(.enabled)
+                            .frame(maxWidth:.infinity,alignment:.leading)
+                    }.frame(height:95)
+                }
+            }
+        }.onChange(of:part) { _ in problem = nil }
+    }
+
+    private func perform(_ action: () throws -> Void) {
+        do { try action(); problem = nil }
+        catch { problem = error.localizedDescription }
     }
 }
 

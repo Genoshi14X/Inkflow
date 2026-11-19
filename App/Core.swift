@@ -163,6 +163,7 @@ struct Chapter: Codable, Sendable {
     var pages: [ScanPage]
     var glossary: String? = nil
     var browserTranslation: String? = nil
+    var browserTranslationFont: String? = nil
 }
 
 enum ScanError: LocalizedError {
@@ -197,11 +198,13 @@ enum ProjectFiles {
         let save = folder.appendingPathComponent(saveName)
         var previous: [String: ScanPage] = [:]
         var browserTranslation: String? = nil
+        var browserTranslationFont: String? = nil
         var glossary: String? = nil
         if FileManager.default.fileExists(atPath: save.path) {
             let old = try JSONDecoder().decode(Chapter.self, from: Data(contentsOf: save))
             guard [1,2].contains(old.version) else { throw ScanError.incompatible }
             browserTranslation = old.browserTranslation
+            browserTranslationFont = old.browserTranslationFont
             glossary = old.glossary
             previous = Dictionary(old.pages.map { ($0.file, $0) }, uniquingKeysWith: { first, _ in first })
         }
@@ -220,7 +223,7 @@ enum ProjectFiles {
                 return old
             }
             return ScanPage(file: url.lastPathComponent, fingerprint: key)
-        }, glossary: glossary, browserTranslation: browserTranslation)
+        }, glossary: glossary, browserTranslation: browserTranslation, browserTranslationFont: browserTranslationFont)
     }
     static func save(_ chapter: Chapter, to folder: URL) throws {
         let encoder = JSONEncoder(); encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
@@ -399,28 +402,5 @@ enum Scanner {
         }
         let panels = PanelDetector.detect(image)
         return ScanPage(file:url.lastPathComponent,width:image.width,height:image.height,blocks:ReadingOrder.blocks(lines,panels:panels),panels:panels,scanned:true,fingerprint:ProjectFiles.fingerprint(url))
-    }
-}
-
-// Preserve every character while keeping browser input below its 10,000-character limit.
-enum BrowserTranslation {
-    static func chunks(_ text: String, limit: Int = 9500) -> [String] {
-        precondition(limit >= 2)
-        var result: [String] = [], current = ""
-        var units = 0
-        for character in text {
-            let next = String(character)
-            if units + next.utf16.count > limit && !current.isEmpty {
-                // Prefer a paragraph/line boundary so replicas usually stay together.
-                if let boundary = current.lastIndex(of: "\n"), current.distance(from: current.startIndex, to: boundary) > current.count / 2 {
-                    let after = current.index(after: boundary)
-                    result.append(String(current[..<after])); current = String(current[after...])
-                } else { result.append(current); current = "" }
-                units = current.utf16.count
-            }
-            current += next; units += next.utf16.count
-        }
-        if !current.isEmpty { result.append(current) }
-        return result
     }
 }

@@ -25,14 +25,14 @@ final class MangaModel: ObservableObject {
     }
     @Published var exportMode: ExportMode = .original
     @Published var showBrowserTranslation = false
-    @Published var browserPart = 0
+    @Published private(set) var browserTranslation: BrowserTranslation? = nil
+    @Published private(set) var browserTranslationProblem: String? = nil
+    @Published var browserTranslationPreview: TranslationImportPlan? = nil
     @Published var pendingTranslationImport: TranslationImportPlan? = nil
+    @Published private(set) var cleaningSkippedPages: [String] = []
     var importTXTName = ""
     var importMapName = ""
-    var browserParts: [String] {
-        guard let chapter else { return [] }
-        return BrowserTranslation.chunks(ProjectFiles.transcript(chapter, mode: .original))
-    }
+    private var browserSourcePasteboardChange: Int?
     @Published var undoHistory: [Chapter] = []
     private var healingJob: HealingJob?
     private var cleaningJob: HealingJob?
@@ -56,6 +56,8 @@ final class MangaModel: ObservableObject {
             guard !loaded.pages.isEmpty else { message = "В папке нет PNG, JPG или JPEG. Выберите папку со страницами главы."; return }
             chapter = loaded; folder = url; selectedPage = loaded.pages.first?.file
             pendingTranslationImport = nil
+            closeBrowserTranslation()
+            cleaningSkippedPages = []
             selectedTextLayer = nil; textEditing = false
             selectedBlock = nil; undoHistory = []; adding = false; healing = false; zoom = 1
             status = "\(loaded.pages.count) стр. · \(loaded.pages.filter(\.scanned).count) распознано · локальная обработка"
@@ -171,7 +173,7 @@ final class MangaModel: ObservableObject {
             else { try? FileManager.default.removeItem(at:mapURL) }
             throw error
         }
-        if autoCleanAfterExport { cleanDetectedText(python:cleaningPython,script:cleaningScript) }
+        if autoCleanAfterExport { cleanDetectedText(afterTXTExport:true,python:cleaningPython,script:cleaningScript) }
     }
     func translationImportPlan(txt: URL, map: URL) throws -> TranslationImportPlan {
         guard !busy, let chapter else { throw TranslationImportError("Откройте главу и дождитесь завершения обработки.") }
@@ -216,21 +218,66 @@ final class MangaModel: ObservableObject {
             }
         } catch { message = error.localizedDescription }
     }
-    @discardableResult func commitTranslationImport(_ plan: TranslationImportPlan, policy: TranslationImportPolicy, allowPartial: Bool, fontName: String? = nil) throws -> Int {
+    private func fittedBrowserTranslation(_ plan: TranslationImportPlan, chapter: Chapter, folder: URL,
+                                          policy: TranslationImportPolicy, fontName: String) throws
+        -> (Chapter, [TranslationImportPlan.Item], Set<UUID>) {
+        guard TextRenderer.supportsRussian(fontName) else {
+            throw TranslationImportError("Этот шрифт недоступен или не поддерживает все русские буквы. Выберите другой шрифт.")
+        }
+        var (updated,items) = try TranslationImporter.applying(plan,to:chapter,policy:policy,allowPartial:false,
+            fontName:fontName,translationModel:"yandex-browser")
+        var sizes: [Int: CGSize] = [:], overflow = Set<UUID>()
+        for item in items {
+            let pageIndex = item.pageIndex
+            let page = updated.pages[pageIndex]
+            let size: CGSize
+            if let cached = sizes[pageIndex] { size = cached }
+            else {
+                guard let dimensions = UpscaleJob.dimensions(folder.appendingPathComponent(page.imagePath)),
+                      dimensions.0 > 0, dimensions.1 > 0 else {
+                    throw TranslationImportError("Не удалось открыть рабочее изображение \(page.file). Проверьте, что файл на месте.")
+                }
+                size = CGSize(width:dimensions.0,height:dimensions.1)
+                sizes[pageIndex] = size
+            }
+            guard let index = page.textLayers?.firstIndex(where:{ $0.id == item.layerID }) else { throw ScanError.missingAnchor }
+            if !TextRenderer.fitTranslation(&updated.pages[pageIndex].textLayers![index],size:size) {
+                overflow.insert(item.blockID)
+            }
+        }
+        updated.browserTranslationFont = fontName
+        return (updated,items,overflow)
+    }
+    func browserTranslationOverflow(_ plan: TranslationImportPlan, policy: TranslationImportPolicy, fontName: String) throws -> Set<UUID> {
+        guard !busy, let chapter, let folder else { throw ScanError.missingAnchor }
+        return try fittedBrowserTranslation(plan,chapter:chapter,folder:folder,policy:policy,fontName:fontName).2
+    }
+    @discardableResult func commitTranslationImport(_ plan: TranslationImportPlan, policy: TranslationImportPolicy, allowPartial: Bool,
+                                                     fontName: String? = nil, fitBrowserText: Bool = false) throws -> Int {
         guard !busy, let previous = chapter, let folder, save() else {
             throw TranslationImportError(message ?? "Не удалось подготовить проект к импорту.")
         }
-        if let fontName, NSFont(name:fontName,size:12) == nil { throw TranslationImportError("Выбранный шрифт недоступен. Выберите установленный шрифт.") }
-        let (updated,items) = try TranslationImporter.applying(plan,to:previous,policy:policy,allowPartial:allowPartial,fontName:fontName)
+        let updated: Chapter, items: [TranslationImportPlan.Item], overflow: Set<UUID>
+        if fitBrowserText {
+            guard let fontName else { throw TranslationImportError("Выберите шрифт для перевода.") }
+            (updated,items,overflow) = try fittedBrowserTranslation(plan,chapter:previous,folder:folder,policy:policy,fontName:fontName)
+        } else {
+            if let fontName, NSFont(name:fontName,size:12) == nil { throw TranslationImportError("Выбранный шрифт недоступен. Выберите установленный шрифт.") }
+            (updated,items) = try TranslationImporter.applying(plan,to:previous,policy:policy,allowPartial:allowPartial,fontName:fontName)
+            overflow = []
+        }
         guard !items.isEmpty else { return 0 }
         // Publish and record undo only after the whole updated project is saved successfully.
         try ProjectFiles.save(updated,to:folder)
         undoHistory.append(previous); if undoHistory.count > 80 { undoHistory.removeFirst() }
         chapter = updated; unsaved = false
-        selectedPage = items[0].key.page
+        let selected = items.first(where:{ overflow.contains($0.blockID) }) ?? items[0]
+        selectedPage = selected.key.page
         selectedBlock = nil; healing = false; adding = false; textEditing = true
-        selectedTextLayer = items[0].layerID
-        status = "Импортировано реплик: \(items.count). Проверьте расположение и размер текста."
+        selectedTextLayer = selected.layerID
+        if fitBrowserText {
+            status = "Добавлено реплик: \(items.count)." + (overflow.isEmpty ? "" : " Проверьте рамки у \(overflow.count) реплик, которые не поместились.")
+        } else { status = "Импортировано реплик: \(items.count). Проверьте расположение и размер текста." }
         return items.count
     }
     func finishTranslationImport(_ plan: TranslationImportPlan, policy: TranslationImportPolicy, allowPartial: Bool, fontName: String? = nil) {
@@ -333,8 +380,13 @@ final class MangaModel: ObservableObject {
     func delete(_ id: UUID) { edit { $0.blocks.removeAll { $0.id == id } }; selectedBlock = nil }
     func undo() {
         guard !busy, var c = undoHistory.popLast() else { return }
-        // Browser drafts are edited independently of page undo history.
+        // Keep the browser draft and preferred face independently of page edits.
         c.browserTranslation = chapter?.browserTranslation
+        c.browserTranslationFont = chapter?.browserTranslationFont
+        if chapter?.pages.map(\.imagePath) != c.pages.map(\.imagePath)
+            || chapter?.pages.map(\.autoCleanSignature) != c.pages.map(\.autoCleanSignature) {
+            cleaningSkippedPages = []
+        }
         chapter = c; unsaved = true; _ = save(); status = "Последняя правка отменена"
     }
     func markReviewed() {
@@ -443,8 +495,11 @@ final class MangaModel: ObservableObject {
         if let job = cleaningJob, job.process.isRunning { job.process.terminate() }
     }
 
-    func cleanDetectedText(python overridePython: URL? = nil, script overrideScript: URL? = nil) {
+    func startTextCleaning() { cleanDetectedText() }
+
+    func cleanDetectedText(afterTXTExport: Bool = false, python overridePython: URL? = nil, script overrideScript: URL? = nil) {
         guard !busy, let source = chapter, let folder, save() else { return }
+        let prefix = afterTXTExport ? "TXT и карта сохранены. " : ""
         let eligible = source.pages.indices.filter { source.pages[$0].scanned && source.pages[$0].blocks.contains { $0.included && !$0.text.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty } }
         let pending = eligible.filter { index in
             let page = source.pages[index]
@@ -452,7 +507,7 @@ final class MangaModel: ObservableObject {
             return page.autoCleanSignature != (try? TextCleaningConfiguration(page:page).signature(imageFingerprint:actual))
         }
         guard !pending.isEmpty else {
-            status = eligible.isEmpty ? "TXT сохранён. Нет распознанных областей для очистки." : "TXT сохранён. Эти области уже очищены; изображения не изменены."
+            status = prefix + (eligible.isEmpty ? "Нет распознанных областей для очистки." : "Эти области уже обработаны.")
             return
         }
         let stored = UserDefaults.standard.string(forKey:"nunifPython").map { URL(fileURLWithPath:$0) }
@@ -461,14 +516,14 @@ final class MangaModel: ObservableObject {
             FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Downloads/nunif/venv/bin/python")]
         guard let python = candidates.compactMap({ $0 }).first(where:{ FileManager.default.isExecutableFile(atPath:$0.path) }),
               let script = overrideScript ?? Bundle.main.url(forResource:"clean-text",withExtension:"py") else {
-            status = "TXT сохранён. Очистка не запущена."
-            message = "TXT и карта сохранены. Для очистки нужен Python с OpenCV и Pillow, выбранный для nunif, и обновлённая сборка Inkflow."
+            status = prefix + "Очистка не запущена."
+            message = prefix + "Для очистки нужен Python с OpenCV и Pillow, выбранный для nunif, и обновлённая сборка Inkflow."
             return
         }
         let run = "cleaned/" + UUID().uuidString
         let directory = folder.appendingPathComponent(run,isDirectory:true)
         busy = true; stopRequested = false; adding = false
-        status = "TXT сохранён. Подготовка очистки текста…"
+        status = prefix + "Подготовка очистки текста…"
         Task {
             var published = false
             defer {
@@ -477,9 +532,10 @@ final class MangaModel: ObservableObject {
             }
             var updated = source
             var totalSmooth = 0, totalTexture = 0, totalSkipped = 0, changedPages = 0
+            var skippedPages: [String] = []
             do {
                 for (number,index) in pending.enumerated() {
-                    if stopRequested { status = "Очистка остановлена. TXT сохранён; рабочие изображения не изменены."; return }
+                    if stopRequested { status = prefix + "Очистка остановлена. Рабочие изображения не изменились."; return }
                     let page = source.pages[index]
                     let input = folder.appendingPathComponent(page.imagePath)
                     // OCR geometry must still describe this working image.
@@ -496,11 +552,12 @@ final class MangaModel: ObservableObject {
                         do { try job.finish(); return nil } catch { return error.localizedDescription }
                     }.value
                     cleaningJob = nil
-                    if stopRequested { status = "Очистка остановлена. TXT сохранён; рабочие изображения не изменены."; return }
+                    if stopRequested { status = prefix + "Очистка остановлена. Рабочие изображения не изменились."; return }
                     if let failure { throw UpscaleFailure("\(page.file): \(failure)") }
                     guard let data = job.reportData else { throw UpscaleFailure("Не получен отчёт очистки \(page.file).") }
                     let report = try JSONDecoder().decode(TextCleaningReport.self,from:data)
                     totalSmooth += report.smooth; totalTexture += report.texture; totalSkipped += report.skipped
+                    if report.skipped > 0 { skippedPages.append("\(page.file) · \(report.skipped)") }
                     if report.changedPixels > 0 {
                         updated.pages[index].imageFile = relative
                         updated.pages[index].fingerprint = ProjectFiles.fingerprint(output)
@@ -513,11 +570,12 @@ final class MangaModel: ObservableObject {
                 try ProjectFiles.save(updated,to:folder)
                 undoHistory.append(source); if undoHistory.count > 80 { undoHistory.removeFirst() }
                 chapter = updated; unsaved = false
+                cleaningSkippedPages = skippedPages
                 published = changedPages > 0
-                status = "TXT сохранён. Очищено страниц: \(changedPages); областей: сглаживание — \(totalSmooth), текстура — \(totalTexture), пропущено — \(totalSkipped). Проверьте результат; очистку можно отменить."
+                status = prefix + "Очищено страниц: \(changedPages). Обработано областей: \(totalSmooth+totalTexture), пропущено: \(totalSkipped)."
             } catch {
-                status = "TXT сохранён. Очистка не завершена; рабочие изображения не изменены."
-                message = "Не удалось очистить текст. \(error.localizedDescription) TXT и карта сохранены. Изображения остались прежними."
+                status = prefix + "Очистка не завершена. Рабочие изображения не изменились."
+                message = prefix + error.localizedDescription
             }
         }
     }
@@ -563,10 +621,10 @@ final class MangaModel: ObservableObject {
         } catch { message = "Не удалось запустить кисть. \(error.localizedDescription)" }
     }
 
-    func scanAll(onlyCurrent: Bool = false) {
+    func scanAll() {
         guard !busy, let c = chapter, let f = folder else { return }
         // Never overwrite existing blocks or manual work through batch recognition.
-        let files = c.pages.filter { !$0.scanned && (!onlyCurrent || $0.file == selectedPage) }.map(\.file)
+        let files = c.pages.filter { !$0.scanned }.map(\.file)
         guard !files.isEmpty else { guard prepareTranslationLayers() else { return }; status = "Страницы уже распознаны. Места перевода подготовлены во вкладке «Текст на странице»."; return }
         busy = true; stopRequested = false; adding = false
         Task {
@@ -638,22 +696,53 @@ final class MangaModel: ObservableObject {
         c.pages[i].translationReviewed = true; chapter = c; unsaved = true; _ = save()
     }
     func beginBrowserTranslation() {
-        guard !busy, let c = chapter, save() else { return }
-        guard c.pages.contains(where: { $0.scanned && $0.blocks.contains(where: { $0.included }) }) else {
-            message = "Сначала распознайте страницы главы."; return
+        guard !busy, chapter != nil, prepareTranslationLayers(), let chapter else { return }
+        do {
+            browserTranslation = try BrowserTranslation(chapter:chapter)
+            browserTranslationProblem = nil
+        } catch {
+            browserTranslation = nil
+            browserTranslationProblem = error.localizedDescription
         }
-        browserPart = 0; showBrowserTranslation = true
+        browserSourcePasteboardChange = nil
+        showBrowserTranslation = true
     }
-    func copyAndOpenYandex() {
-        let parts = browserParts
-        guard parts.indices.contains(browserPart) else { return }
-        NSPasteboard.general.clearContents()
-        guard NSPasteboard.general.setString(parts[browserPart], forType: .string) else {
-            message = "Не удалось скопировать текст. Попробуйте ещё раз."; return
+    func closeBrowserTranslation() {
+        showBrowserTranslation = false
+        browserTranslation = nil
+        browserTranslationProblem = nil
+        browserTranslationPreview = nil
+        browserSourcePasteboardChange = nil
+    }
+    func copyAndOpenYandex(part: Int) throws {
+        guard let parts = browserTranslation?.parts, parts.indices.contains(part) else { return }
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        guard pasteboard.setString(parts[part].source,forType:.string) else {
+            throw TranslationImportError("Не удалось скопировать оригинал. Попробуйте ещё раз.")
         }
-        if NSWorkspace.shared.open(URL(string:"https://translate.yandex.ru/?source_lang=en&target_lang=ru")!) {
-            status = "Английский текст скопирован. Вставьте его в Яндекс Переводчик: ⌘V."
-        } else { message = "Текст скопирован, но браузер не открылся. Откройте translate.yandex.ru и вставьте текст: ⌘V." }
+        browserSourcePasteboardChange = pasteboard.changeCount
+        guard NSWorkspace.shared.open(URL(string:"https://translate.yandex.ru/?source_lang=en&target_lang=ru")!) else {
+            throw TranslationImportError("Оригинал скопирован. Откройте translate.yandex.ru и вставьте его в левое поле.")
+        }
+    }
+    func browserResultFromPasteboard() throws -> String {
+        let pasteboard = NSPasteboard.general
+        guard pasteboard.changeCount != browserSourcePasteboardChange,
+              let text = pasteboard.string(forType:.string), !text.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty else {
+            throw TranslationImportError("Скопируйте русский результат из правого поля Яндекса.")
+        }
+        return text
+    }
+    func acceptBrowserResult(_ text: String, for part: Int) throws {
+        try browserTranslation?.accept(text,for:part)
+    }
+    func clearBrowserResult(for part: Int) {
+        browserTranslation?.clearResult(for:part)
+    }
+    func reviewBrowserTranslation() throws {
+        guard !busy, let chapter, let browserTranslation else { return }
+        browserTranslationPreview = try browserTranslation.plan(for:chapter)
     }
     func setBrowserTranslation(_ text: String) {
         guard chapter != nil else { return }

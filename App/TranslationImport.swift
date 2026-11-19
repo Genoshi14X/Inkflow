@@ -87,6 +87,92 @@ enum TranslationImportPolicy: String, CaseIterable {
     case replaceExisting = "Заменить текст переводом из файла"
 }
 
+struct BrowserTranslation {
+    struct Part {
+        let source: String
+        fileprivate let keys: [Int: TranslationKey]
+    }
+
+    let map: TextExportMap
+    let parts: [Part]
+    private let sessionNumber: Int
+    private var results: [Int: [TranslationDocument.Entry]] = [:]
+    private static let marker = try! NSRegularExpression(pattern:#"\[\s*\[\s*([0-9]{8})\s*-\s*([0-9]+)\s*-\s*([12])\s*\]\s*\]"#)
+
+    init(chapter: Chapter, limit: Int = 9500) throws {
+        var map = try TextExportMap(chapter:chapter,mode:.original)
+        map.entries.removeAll { $0.source.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty }
+        guard !map.entries.isEmpty else { throw TranslationImportError("Сначала распознайте страницы и включите нужные реплики в TXT.") }
+        let sessionNumber = Int.random(in:10000000...99999999)
+        var parts: [Part] = [], source = ""
+        var keys: [Int: TranslationKey] = [:]
+        var units = 0
+        for (index,entry) in map.entries.enumerated() {
+            let key = TranslationKey(page:entry.page,number:entry.number)
+            let number = index + 1
+            let dialogue = entry.source.trimmingCharacters(in:.whitespacesAndNewlines)
+            guard !dialogue.contains("[[\(sessionNumber)-") else {
+                throw TranslationImportError("В реплике \(key.label) встретилась служебная метка. Откройте перевод снова.")
+            }
+            let record = "[[\(sessionNumber)-\(number)-1]]\n\(dialogue)\n[[\(sessionNumber)-\(number)-2]]"
+            let length = record.utf16.count
+            guard length <= limit else {
+                throw TranslationImportError("Реплика \(key.label) слишком длинная для браузерного режима. Переведите главу через экспорт и импорт TXT.")
+            }
+            if units + 2 + length > limit, !keys.isEmpty {
+                parts.append(Part(source:source,keys:keys))
+                source = ""; keys = [:]; units = 0
+            }
+            if units > 0 { source += "\n\n"; units += 2 }
+            source += record; units += length
+            keys[number] = key
+        }
+        parts.append(Part(source:source,keys:keys))
+        self.map = map; self.parts = parts; self.sessionNumber = sessionNumber
+    }
+
+    func hasResult(for index: Int) -> Bool { results[index] != nil }
+    var completedParts: Int { results.count }
+    mutating func clearResult(for index: Int) { results[index] = nil }
+
+    mutating func accept(_ text: String, for index: Int) throws {
+        guard parts.indices.contains(index) else { return }
+        let part = parts[index]
+        let whitespace = CharacterSet.whitespacesAndNewlines.union(CharacterSet(charactersIn:"\u{feff}"))
+        let marks = Self.marker.matches(in:text,range:NSRange(text.startIndex...,in:text))
+        let invalid = TranslationImportError("Не удалось сопоставить реплики в части \(index + 1). Скопируйте весь результат из Яндекса вместе с метками или исправьте метки в поле ниже.")
+        guard marks.count == 2 * part.keys.count else { throw invalid }
+        var entries: [TranslationDocument.Entry] = [], seen = Set<Int>()
+        var cursor = text.startIndex
+        for pair in stride(from:0,to:marks.count,by:2) {
+            let start = marks[pair], end = marks[pair+1]
+            guard let startRange = Range(start.range,in:text), let endRange = Range(end.range,in:text),
+                  text[cursor..<startRange.lowerBound].trimmingCharacters(in:whitespace).isEmpty,
+                  let startSession = Range(start.range(at:1),in:text), let endSession = Range(end.range(at:1),in:text),
+                  Int(text[startSession]) == sessionNumber, text[startSession] == text[endSession],
+                  let startNumber = Range(start.range(at:2),in:text), let endNumber = Range(end.range(at:2),in:text),
+                  text[startNumber] == text[endNumber], let number = Int(text[startNumber]),
+                  let startKind = Range(start.range(at:3),in:text), let endKind = Range(end.range(at:3),in:text),
+                  text[startKind] == "1", text[endKind] == "2",
+                  let key = part.keys[number], seen.insert(number).inserted else { throw invalid }
+            let value = text[startRange.upperBound..<endRange.lowerBound].trimmingCharacters(in:whitespace)
+            guard !value.isEmpty else {
+                throw TranslationImportError("Пустой перевод для \(key.label) в части \(index + 1). Заполните реплику между её метками.")
+            }
+            entries.append(.init(key:key,text:value))
+            cursor = endRange.upperBound
+        }
+        guard text[cursor...].trimmingCharacters(in:whitespace).isEmpty else { throw invalid }
+        results[index] = entries
+    }
+
+    func plan(for chapter: Chapter) throws -> TranslationImportPlan {
+        guard completedParts == parts.count else { throw TranslationImportError("Вставьте перевод всех частей.") }
+        let document = TranslationDocument(entries:parts.indices.flatMap { results[$0] ?? [] })
+        return try TranslationImporter.plan(document:document,map:map,chapter:chapter)
+    }
+}
+
 struct TranslationImportPlan: Identifiable {
     struct Item: Identifiable {
         var id: UUID { blockID }
@@ -185,7 +271,8 @@ enum TranslationImporter {
         let missing = map.entries.map { TranslationKey(page:$0.page,number:$0.number) }.filter { !imported.contains($0) }
         return TranslationImportPlan(document:document,map:map,items:items,missing:missing)
     }
-    static func applying(_ original: TranslationImportPlan, to chapter: Chapter, policy: TranslationImportPolicy, allowPartial: Bool, fontName: String? = nil) throws -> (Chapter, [TranslationImportPlan.Item]) {
+    static func applying(_ original: TranslationImportPlan, to chapter: Chapter, policy: TranslationImportPolicy, allowPartial: Bool,
+                         fontName: String? = nil, translationModel: String = "imported-txt") throws -> (Chapter, [TranslationImportPlan.Item]) {
         // Resolve IDs again so a stale preview can never write to a different layer.
         let plan = try self.plan(document:original.document,map:original.map,chapter:chapter)
         guard plan.missing.isEmpty || allowPartial else { throw TranslationImportError("В TXT отсутствует часть реплик. Подтвердите частичный импорт в окне проверки.") }
@@ -207,7 +294,7 @@ enum TranslationImporter {
             updated.pages[p].textLayers![l].text = item.text
             updated.pages[p].textLayers![l].anchorEdited = true
             let context = ProjectFiles.translationContext(updated.pages[p],glossary:updated.glossary)
-            updated.pages[p].blocks[b].translation = TranslationRecord(text:item.text,source:updated.pages[p].blocks[b].text,context:context,model:"imported-txt")
+            updated.pages[p].blocks[b].translation = TranslationRecord(text:item.text,source:updated.pages[p].blocks[b].text,context:context,model:translationModel)
             updated.pages[p].translationReviewed = false
         }
         return (updated,items)

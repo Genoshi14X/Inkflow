@@ -37,6 +37,8 @@ import ImageIO
         }
         chapter.pages[0].imageFile = "edited/working.png"
         chapter.pages[0].fingerprint = ProjectFiles.fingerprint(folder.appendingPathComponent("edited/working.png"))
+        let blank = Box(x:0.04,y:0.05,width:0.1,height:0.1)
+        chapter.pages[1].blocks.append(TextBlock(text:"Blank",original:"Blank",box:blank,ocrLines:[blank]))
         chapter.browserTranslation = "Не менять черновик"
         try ProjectFiles.save(chapter,to:folder)
         let model = MangaModel(); model.autoCleanAfterExport = true; model.open(folder)
@@ -52,6 +54,7 @@ import ImageIO
         while model.busy { try await Task.sleep(nanoseconds:20_000_000) }
         precondition(model.message == nil,model.message ?? "")
         precondition(model.chapter!.pages.allSatisfy { $0.imageFile?.hasPrefix("cleaned/") == true && $0.autoCleanSignature != nil })
+        precondition(model.cleaningSkippedPages == ["02.png · 1"])
         precondition(model.chapter!.pages[0].textLayers?.first?.rotation == 15)
         precondition(model.chapter!.pages[0].blocks[0].translation?.text == "ПРИВЕТ" && model.chapter!.browserTranslation == "Не менять черновик")
         let newPaths = model.chapter!.pages.map(\.imagePath)
@@ -95,6 +98,13 @@ import ImageIO
         precondition(model.message != nil && model.chapter!.pages[0].imagePath == "edited/working.png")
         try fm.removeItem(at:project); try savedProject.write(to:project)
         precondition(fm.fileExists(atPath:txt.path))
-        print("PASS: TXT-before-cleanup, failed export gating, active image, chapter atomicity, repeat/export/reopen, OCR/translation/layers preservation, source protection, one-step undo, page failure, cancellation and save failure")
+        try fm.removeItem(at:txt); try fm.removeItem(at:TextExportMap.url(for:txt))
+        model.message = nil
+        model.cleanDetectedText(python:python,script:script)
+        while model.busy { try await Task.sleep(nanoseconds:20_000_000) }
+        precondition(model.message == nil && model.chapter!.pages.allSatisfy { $0.imageFile?.hasPrefix("cleaned/") == true })
+        precondition(!model.status.contains("TXT") && !fm.fileExists(atPath:txt.path) && !fm.fileExists(atPath:TextExportMap.url(for:txt).path))
+        precondition(model.cleaningSkippedPages == ["02.png · 1"])
+        print("PASS: manual and post-export cleanup, skipped pages, failed export gating, active image, chapter atomicity, repeat/export/reopen, OCR/translation/layers preservation, source protection, one-step undo, page failure, cancellation and save failure")
     }
 }

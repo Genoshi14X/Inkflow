@@ -114,6 +114,73 @@ import ImageIO
         while model.busy { try await Task.sleep(nanoseconds:10_000_000) }
         precondition(model.lastBatchExportURL == nil)
         let after = try Data(contentsOf:image); precondition(before == after)
+        try checkBrowserTranslation(in:root,image:image,size:size,pixels:pixels)
         print("PASS: rotation gesture, outline/fill raster, legacy/persisted styling, keyboard increments, complete batch export, single/batch equivalence, failure cleanup, cancellation and source protection")
+    }
+
+    @MainActor static func checkBrowserTranslation(in folder: URL, image: URL, size: CGSize, pixels: (URL) -> [UInt8]) throws {
+        let a = TextBlock(text:"EN first",original:"EN first",box:Box(x:0.1,y:0.1,width:0.25,height:0.1))
+        let b = TextBlock(text:"EN second",original:"EN second",box:Box(x:0.6,y:0.3,width:0.08,height:0.025))
+        let c = TextBlock(text:"EN third",original:"EN third",box:Box(x:0.4,y:0.7,width:0.3,height:0.15))
+        var page = ScanPage(file:image.lastPathComponent,width:Int(size.width),height:Int(size.height),blocks:[a,b,c],scanned:true,
+                            fingerprint:ProjectFiles.fingerprint(image))
+        TranslationAnchors.ensure(in:&page)
+        page.textLayers![0].outline = TextOutline(widthScale:0.001)
+        page.textLayers![0].widthScale = 1.1
+        page.textLayers![0].lineSpacing = 0.002
+        page.textLayers![2].text = "Ручной перевод"
+        let original = Chapter(name:folder.lastPathComponent,pages:[page],browserTranslation:"Старый черновик")
+        try ProjectFiles.save(original,to:folder)
+        let model = MangaModel(); model.open(folder); model.beginBrowserTranslation()
+        let english = model.browserTranslation!.parts[0].source
+        let first = "Привет! Куда ты идёшь? Я давно тебя ищу."
+        let long = String(repeating:"Длинная реплика с буквой ё. ",count:10).trimmingCharacters(in:.whitespaces)
+        try model.acceptBrowserResult(english.replacingOccurrences(of:a.text,with:first)
+            .replacingOccurrences(of:b.text,with:long).replacingOccurrences(of:c.text,with:"Новый перевод"),for:0)
+        model.move(a.id,by:1)
+        try model.reviewBrowserTranslation()
+        let plan = model.browserTranslationPreview!
+        precondition(plan.conflicts == 1)
+        let font = "Helvetica-Oblique"
+        let overflow = try model.browserTranslationOverflow(plan,policy:.keepExisting,fontName:font)
+        precondition(overflow == [b.id])
+        precondition(model.page!.textLayers == page.textLayers)
+        let count = try model.commitTranslationImport(plan,policy:.keepExisting,allowPartial:false,fontName:font,fitBrowserText:true)
+        precondition(count == 2 && model.selectedTextLayer == page.textLayers![1].id)
+        let fitted = model.page!.textLayers![0], tooLong = model.page!.textLayers![1]
+        precondition(fitted.box == page.textLayers![0].box && fitted.outline == page.textLayers![0].outline)
+        precondition(fitted.fontName == font && fitted.text == first && fitted.fontScale < page.textLayers![0].fontScale)
+        precondition(TextRenderer.fits(fitted,size:size) && !TextRenderer.fits(tooLong,size:size))
+        precondition(tooLong.text == long && abs(tooLong.fontScale*size.width-12) < 0.001)
+        var narrow = fitted
+        narrow.box.width = 0.005
+        narrow.text = "Ш"
+        precondition(!TextRenderer.fitTranslation(&narrow,size:size),"A glyph wider than the frame must be flagged")
+        precondition(model.page!.textLayers![2] == page.textLayers![2])
+        precondition(model.page!.blocks.first { $0.id == a.id }?.translation?.text == first)
+        let output = folder.appendingPathComponent("browser-render.png")
+        try TextRenderer.export(image:image,layers:[fitted],to:output)
+        let rendered = pixels(output)
+        let background = pixels(image)
+        let textBox = TextRenderer.rect(fitted,size:size).insetBy(dx:-3,dy:-3)
+        var changed = 0
+        for index in stride(from:0,to:rendered.count,by:4) where rendered[index] != background[index] {
+            let position = index/4
+            let p = CGPoint(x:position % Int(size.width),y:position/Int(size.width))
+            precondition(textBox.contains(p),"Fitted glyph pixels must stay in the frame")
+            changed += 1
+        }
+        precondition(changed > 100)
+        let reopened = try ProjectFiles.load(folder)
+        precondition(reopened.browserTranslationFont == font && reopened.browserTranslation == original.browserTranslation)
+        precondition(reopened.pages.first { $0.file == page.file }?.textLayers == model.page!.textLayers)
+        let again = try model.commitTranslationImport(plan,policy:.keepExisting,allowPartial:false,fontName:font,fitBrowserText:true)
+        precondition(again == 0)
+        model.undo()
+        precondition(model.page!.textLayers == page.textLayers && model.page!.blocks.allSatisfy { $0.translation == nil })
+        precondition(model.chapter?.browserTranslationFont == font)
+        model.closeBrowserTranslation()
+        precondition(model.browserTranslation == nil && model.browserTranslationPreview == nil)
+        print("PASS: browser output to stable layers, Cyrillic fit, overflow, raster bounds, conflict, one-step undo and reopen")
     }
 }
